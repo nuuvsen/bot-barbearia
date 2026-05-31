@@ -1,0 +1,17 @@
+{
+  "name": "bot-barbearia-isolado",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "subir": "git add . && git commit -m \"Atualizando projeto\" && git push"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "firebase-admin": "^11.11.0",
+    "node-cron": "^4.2.1",
+    "qrcode": "^1.5.3",
+    "whatsapp-web.js": "^1.23.0"
+  }
+}

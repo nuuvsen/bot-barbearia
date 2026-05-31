@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  bot-service:
+    build: .
+    container_name: whatsapp-bot-api
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./.wwebjs_auth:/usr/src/app/.wwebjs_auth
+    restart: always
+    networks:
+      - barbearia-net
+
+networks:
+  barbearia-net:
+    external: true
+    name: barbearia-network
