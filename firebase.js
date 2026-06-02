@@ -31,4 +31,7 @@ admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
 });
 
-// ... resto do seu código ...
+// 4. Cria a conexão com o banco de dados e exporta para o index.js
+const db = admin.firestore();
+
+module.exports = db;
