@@ -4,16 +4,22 @@ const path = require('path');
 
 let serviceAccount;
 
-// 1. Tenta pegar a chave do Portainer (Variável de Ambiente)
 if (process.env.FIREBASE_JSON) {
   try {
-    serviceAccount = JSON.parse(process.env.FIREBASE_JSON);
+    let jsonString = process.env.FIREBASE_JSON;
+    
+    // Se o texto for Base64 (não começa com '{'), nós convertemos de volta
+    if (!jsonString.trim().startsWith('{')) {
+      jsonString = Buffer.from(jsonString, 'base64').toString('utf8');
+    }
+
+    serviceAccount = JSON.parse(jsonString);
   } catch (error) {
-    console.error("❌ Erro ao ler a variável FIREBASE_JSON. O JSON está mal formatado.");
-    process.exit(1);
+    console.error("❌ O formato da chave FIREBASE_JSON que chegou no container está quebrado.");
+    console.error("Erro interno:", error.message);
+    process.exit(1); 
   }
 } 
-// 2. Se não tem variável, tenta pegar o arquivo físico (Seu PC)
 else {
   const caminhoChave = path.join(__dirname, 'firebase-key.json');
   
@@ -21,17 +27,15 @@ else {
     serviceAccount = require(caminhoChave);
   } else {
     console.error("❌ CREDENCIAIS DO FIREBASE NÃO ENCONTRADAS!");
-    console.error("Você precisa configurar a variável FIREBASE_JSON no Portainer.");
-    process.exit(1); // Para o bot graciosamente sem dar aquele erro gigante
+    process.exit(1);
   }
 }
 
-// 3. Inicializa o Firebase
+// Inicializa o Firebase
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
 });
 
-// 4. Cria a conexão com o banco de dados e exporta para o index.js
+// Exporta o banco de dados
 const db = admin.firestore();
-
 module.exports = db;
