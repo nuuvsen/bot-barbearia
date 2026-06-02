@@ -13,6 +13,8 @@ services:
     environment:
       # A porta que o Express vai rodar dentro do container
       - PORT=3001
+      # 👇 Olha a mágica aqui: isso avisa o Portainer para puxar a variável da lista
+      - FIREBASE_JSON=${FIREBASE_JSON}
     restart: always
     networks:
       - barbearia-net
