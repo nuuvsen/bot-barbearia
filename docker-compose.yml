@@ -2,17 +2,26 @@ version: '3.8'
 
 services:
   bot-service:
+    image: nuuvsen/bot-barbearia:latest
     build: .
-    container_name: whatsapp-bot-api
+    container_name: Bot-barbearia
     ports:
-      - "3002:3001"
+      - "3002:3001" # Evita o conflito da porta 3001 que você teve anteriormente
     volumes:
-      - ./.wwebjs_auth:/usr/src/app/.wwebjs_auth
+      # Isso salva a sessão do WhatsApp de forma persistente através do Docker
+      - bot_auth_data:/usr/src/app/.wwebjs_auth
+    environment:
+      # A porta que o Express vai rodar dentro do container
+      - PORT=3001
     restart: always
     networks:
       - barbearia-net
 
+# Declaração do volume persistente
+volumes:
+  bot_auth_data:
+
 networks:
   barbearia-net:
     external: true
-    name: barbearia-network
+    name: barbearia-networks
