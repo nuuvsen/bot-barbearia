@@ -5,7 +5,7 @@ services:
     build: .
     container_name: whatsapp-bot-api
     ports:
-      - "3001:3001"
+      - "3002:3001"
     volumes:
       - ./.wwebjs_auth:/usr/src/app/.wwebjs_auth
     restart: always
