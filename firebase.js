@@ -13,9 +13,6 @@ admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
 });
 
-// ... resto do seu código (exportar db, etc)
-const serviceAccount = require('./firebase-key.json');
-
 // Inicializa a conexão com o banco usando a sua chave secreta
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
