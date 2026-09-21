@@ -1,0 +1,9 @@
+node_modules
+.git
+.wwebjs_auth
+.wwebjs_cache
+.env
+
+# Nunca copiar a chave de serviço do Firebase pra dentro da imagem — o container recebe
+# as credenciais pela variável de ambiente FIREBASE_JSON (veja docker-compose.yml).
+firebase-key.json

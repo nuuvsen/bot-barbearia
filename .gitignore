@@ -1,4 +1,13 @@
 node_modules
 .wwebjs_auth
+.wwebjs_cache
 .env
+
+# Chave de serviço do Firebase — é uma credencial real, nunca deve ir pro Git.
+# Em Docker, prefira passar o conteúdo dela pela variável de ambiente FIREBASE_JSON
+# (veja docker-compose.yml e firebase.js) em vez de copiar esse arquivo pra imagem.
 firebase-key.json
+
+# Itens temporários/scratch (não fazem parte do projeto)
+_to_delete/
+_scratch_temporario/
