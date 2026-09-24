@@ -148,6 +148,10 @@ testarConexaoFirebase();
 const client = new Client({
     authStrategy: new LocalAuth(),
     puppeteer: {
+        // Em produção (Docker), aponta pro Chromium instalado via apt no Dockerfile em vez
+        // de baixar/usar o Chromium embutido do Puppeteer. Sem isso, o PUPPETEER_EXECUTABLE_PATH
+        // fica sem efeito e o Puppeteer tenta abrir um binário que a gente instruiu ele a não baixar.
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
         args: ['--no-sandbox', '--disable-setuid-sandbox']
     }
 });
