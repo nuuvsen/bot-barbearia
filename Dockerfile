@@ -27,4 +27,9 @@ COPY . .
 
 EXPOSE 3002
 
+# Remove o entrypoint automático herdado da imagem base do Node: ele estava
+# interceptando o "docker run <imagem> <comando>" e engolindo a saída/execução em
+# alguns cenários. Rodar o node direto como processo principal é mais simples e
+# também lida melhor com sinais de desligamento do container.
+ENTRYPOINT []
 CMD ["node", "index.js"]
