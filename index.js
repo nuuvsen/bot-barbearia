@@ -186,6 +186,13 @@ testarConexaoFirebase();
 
 const client = new Client({
     authStrategy: new LocalAuth(),
+    // O padrao do whatsapp-web.js pra "authTimeoutMs" e so 45 segundos — tempo entre o
+    // celular escanear o QR e o handshake de autenticacao terminar. Nessa box, com o
+    // Chromium disputando CPU (load average tem passado de 7 num box de 4 nucleos fracos),
+    // esse handshake pode demorar mais que isso e o processo derruba a sessao com
+    // "reason: auth timeout" logo apos o QR ser lido — foi o que apareceu no log. Aumenta
+    // pra 5 minutos, mesma margem do protocolTimeout do Puppeteer abaixo.
+    authTimeoutMs: 300000,
     puppeteer: {
         // Em produção (Docker), aponta pro Chromium instalado via apt no Dockerfile em vez
         // de baixar/usar o Chromium embutido do Puppeteer. Sem isso, o PUPPETEER_EXECUTABLE_PATH
@@ -224,7 +231,23 @@ const client = new Client({
             '--disable-translate',
             '--metrics-recording-only',
             '--mute-audio',
-            '--safebrowsing-disable-auto-update'
+            '--safebrowsing-disable-auto-update',
+            // Reduz mais ainda trabalho de fundo/CPU (timers, hang monitor, IPC throttling)
+            // e some com o cache em disco do Chromium — a box roda de cartao/eMMC lento e
+            // o cache gerava espera de I/O (processo aparecendo em estado "D" no htop).
+            '--disable-background-timer-throttling',
+            '--disable-backgrounding-occluded-windows',
+            '--disable-renderer-backgrounding',
+            '--disable-ipc-flooding-protection',
+            '--disable-hang-monitor',
+            '--disable-client-side-phishing-detection',
+            '--disable-component-update',
+            '--disable-domain-reliability',
+            '--disable-prompt-on-repost',
+            '--disable-notifications',
+            '--disable-popup-blocking',
+            '--disk-cache-size=1',
+            '--media-cache-size=1'
         ],
         // Essa box eh MUITO lenta pra rodar Chromium — o timeout padrao do protocolo
         // (comunicacao interna Puppeteer <-> Chromium) e curto demais e estava estourando
