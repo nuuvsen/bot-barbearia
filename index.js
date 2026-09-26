@@ -152,7 +152,29 @@ const client = new Client({
         // de baixar/usar o Chromium embutido do Puppeteer. Sem isso, o PUPPETEER_EXECUTABLE_PATH
         // fica sem efeito e o Puppeteer tenta abrir um binário que a gente instruiu ele a não baixar.
         executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-        args: ['--no-sandbox', '--disable-setuid-sandbox']
+        // Flags extras pensadas pra rodar num container com pouca memoria/CPU (a box
+        // Armbian tem só 787MB de RAM). Sem "--disable-dev-shm-usage" o Chromium tenta usar
+        // a memoria compartilhada /dev/shm do container, que por padrao no Docker vem
+        // limitada a so 64MB — quando enche, o Chromium fica instavel/lento e isso ja
+        // contribuiu pra travar a box inteira. As outras reduzem trabalho de fundo que a
+        // gente nao precisa (GPU, sync, extensões, telemetria).
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-accelerated-2d-canvas',
+            '--disable-gpu',
+            '--no-first-run',
+            '--no-zygote',
+            '--disable-extensions',
+            '--disable-background-networking',
+            '--disable-default-apps',
+            '--disable-sync',
+            '--disable-translate',
+            '--metrics-recording-only',
+            '--mute-audio',
+            '--safebrowsing-disable-auto-update'
+        ]
     }
 });
 
