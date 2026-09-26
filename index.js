@@ -275,6 +275,16 @@ client.on('ready', () => {
 client.on('disconnected', (reason) => {
     console.log('Bot desconectado:', reason);
     botStatus = 'desconectado';
+
+    // Se a desconexao nao veio de um "Reiniciar Bot" manual pelo painel (que ja cuida
+    // do seu proprio destroy+initialize logo abaixo), tenta reconectar sozinho. Cobre
+    // o caso comum de "LOGOUT" (sessao cai por causa do bug conhecido do whatsapp-web.js
+    // durante a inicializacao, ver comentario em inicializarClientComRetry) sem precisar
+    // o administrador clicar em "Reiniciar Bot" manualmente toda vez.
+    if (!reiniciandoBot) {
+        console.log('🔁 Tentando reconectar automaticamente apos desconexao...');
+        inicializarClientComRetry();
+    }
 });
 
 function limparNumeroDigitado(texto) {
@@ -772,9 +782,122 @@ client.on('message', async msg => {
     }
 });
 
-client.initialize();
+// =====================================================================
+// 🔁 INICIALIZACAO COM RETRY AUTOMATICO (contorna bug conhecido do whatsapp-web.js)
+// -----------------------------------------------------------------------
+// O whatsapp-web.js tem um bug conhecido e ainda aberto na propria biblioteca (varios
+// relatos de outros usuarios, nao e coisa da nossa configuracao):
+//   https://github.com/wwebjs/whatsapp-web.js/issues/3809
+//   https://github.com/wwebjs/whatsapp-web.js/issues/127056
+//   https://github.com/wwebjs/whatsapp-web.js/issues/3792
+// A injecao do script na pagina do WhatsApp Web pode colidir com um recarregamento
+// da propria pagina bem no meio da inicializacao, gerando "Execution context was
+// destroyed, most likely because of a navigation" (ou variantes como "auth timeout"
+// / "Protocol error"). Isso fica mais frequente quanto mais lenta a maquina — o
+// Chromium demora mais pra "assentar" depois do carregamento inicial, alargando a
+// janela onde esse recarregamento pode colidir com a injecao. Nao ha flag do Chromium
+// que elimina isso (testamos varias combinacoes); e um bug ainda sem correcao
+// definitiva rio acima.
+//
+// Sem tratamento, esse erro derruba o processo Node inteiro (uncaught exception ou
+// unhandled rejection), forcando o Docker a religar o container do zero — caro nessa
+// box (Chromium sobe de novo, mais carga, mais chance de bater na mesma falha outra
+// vez). Em vez disso, capturamos especificamente esses erros JA CONHECIDOS e tentamos
+// inicializar de novo no MESMO processo (sem recriar o container). Ja vimos aqui que a
+// inicializacao as vezes funciona de primeira — o retry insiste ate isso acontecer.
+// Qualquer erro QUE NAO seja um desses conhecidos ainda derruba o processo normalmente
+// (deixamos o Docker religar), pra nao mascarar um bug real diferente.
+const ERROS_TRANSITORIOS_CONHECIDOS = [
+    'Execution context was destroyed',
+    'auth timeout',
+    'Protocol error',
+    'Target closed',
+    'Session closed'
+];
+
+function eErroTransitorioConhecido(erro) {
+    const mensagem = String((erro && erro.message) || erro || '');
+    return ERROS_TRANSITORIOS_CONHECIDOS.some(padrao => mensagem.includes(padrao));
+}
+
+let tentativasInicializacao = 0;
+const MAX_TENTATIVAS_INICIALIZACAO = 30; // teto generoso, so pra nao girar pra sempre em silencio
+let retryDeInicializacaoEmAndamento = false;
+
+async function inicializarClientComRetry() {
+    try {
+        await client.initialize();
+        tentativasInicializacao = 0;
+    } catch (erro) {
+        await tratarErroDeInicializacao(erro);
+    }
+}
+
+async function tratarErroDeInicializacao(erro) {
+    if (!eErroTransitorioConhecido(erro)) {
+        console.error('❌ Erro inesperado na inicializacao do WhatsApp (nao e um dos erros conhecidos), deixando o processo cair para o Docker religar o container:', erro);
+        throw erro;
+    }
+
+    tentativasInicializacao++;
+    console.warn(`⚠️ Erro conhecido do whatsapp-web.js na inicializacao (tentativa ${tentativasInicializacao}/${MAX_TENTATIVAS_INICIALIZACAO}): ${erro.message || erro}`);
+
+    if (tentativasInicializacao >= MAX_TENTATIVAS_INICIALIZACAO) {
+        console.error('❌ Excedeu o numero maximo de tentativas de inicializacao em processo. Deixando o processo cair para o Docker religar o container do zero.');
+        throw erro;
+    }
+
+    if (retryDeInicializacaoEmAndamento) return; // ja tem um retry em andamento, nao empilha outro
+    retryDeInicializacaoEmAndamento = true;
+
+    try {
+        try {
+            await client.destroy();
+        } catch (erroDestroy) {
+            // Se o destroy tambem falhar (comum quando o Chromium ja esta num estado ruim
+            // depois desse tipo de erro), ignora e tenta inicializar mesmo assim.
+        }
+
+        const esperaMs = Math.min(2000 * tentativasInicializacao, 15000);
+        await new Promise(resolve => setTimeout(resolve, esperaMs));
+        await inicializarClientComRetry();
+    } finally {
+        retryDeInicializacaoEmAndamento = false;
+    }
+}
+
+// Sem isso, uma promise rejeitada sem .catch() (como a que o Client.initialize() do
+// whatsapp-web.js pode gerar internamente) derruba o processo Node inteiro por padrao.
+// Com o handler, so derrubamos de proposito quando NAO for um dos erros conhecidos.
+process.on('unhandledRejection', (erro) => {
+    if (eErroTransitorioConhecido(erro)) {
+        console.warn('⚠️ Promise rejeitada com erro conhecido, tratando via retry em vez de derrubar o processo.');
+        tratarErroDeInicializacao(erro).catch(erroFinal => {
+            console.error('❌ Retry esgotado apos unhandledRejection:', erroFinal);
+            process.exit(1);
+        });
+        return;
+    }
+    console.error('❌ unhandledRejection inesperado, deixando o processo cair:', erro);
+    process.exit(1);
+});
+
+process.on('uncaughtException', (erro) => {
+    if (eErroTransitorioConhecido(erro)) {
+        console.warn('⚠️ Excecao com erro conhecido, tratando via retry em vez de derrubar o processo.');
+        tratarErroDeInicializacao(erro).catch(erroFinal => {
+            console.error('❌ Retry esgotado apos uncaughtException:', erroFinal);
+            process.exit(1);
+        });
+        return;
+    }
+    console.error('❌ uncaughtException inesperado, deixando o processo cair:', erro);
+    process.exit(1);
+});
 
 let reiniciandoBot = false;
+
+inicializarClientComRetry();
 
 app.get('/api/bot/status', (req, res) => {
     res.json({
