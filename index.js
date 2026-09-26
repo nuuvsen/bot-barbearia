@@ -11,6 +11,45 @@ const cron = require('node-cron');
 // também dá acesso a admin.messaging() (notificações push), que db (só o Firestore) não tem.
 const admin = require('firebase-admin');
 
+const fs = require('fs');
+const path = require('path');
+
+// Remove locks do Chromium que sobraram de uma sessao anterior que nao fechou direito
+// (crash, "docker stop" forcado, a box travando). Sem isso, o Chromium as vezes se
+// recusa a abrir de novo achando que ainda tem outro processo usando o mesmo profile
+// ("Failed to launch the browser process... Chromium has locked the profile") e fica
+// preso nesse erro pra sempre, em vez de so acontecer uma vez e se resolver sozinho.
+// Roda isso ANTES de criar o Client, toda vez que o processo sobe.
+function limparLocksChromiumAntigos() {
+    const dirAuth = path.join(__dirname, '.wwebjs_auth');
+    if (!fs.existsSync(dirAuth)) return;
+
+    const pilha = [dirAuth];
+    while (pilha.length) {
+        const dirAtual = pilha.pop();
+        let entradas;
+        try {
+            entradas = fs.readdirSync(dirAtual, { withFileTypes: true });
+        } catch (erro) {
+            continue;
+        }
+        for (const entrada of entradas) {
+            const caminhoCompleto = path.join(dirAtual, entrada.name);
+            if (entrada.isDirectory()) {
+                pilha.push(caminhoCompleto);
+            } else if (/^Singleton(Lock|Cookie|Socket)$/i.test(entrada.name)) {
+                try {
+                    fs.unlinkSync(caminhoCompleto);
+                    console.log('🧹 Removido lock antigo do Chromium:', caminhoCompleto);
+                } catch (erro) {
+                    console.error('Não consegui remover lock antigo:', caminhoCompleto, erro.message);
+                }
+            }
+        }
+    }
+}
+limparLocksChromiumAntigos();
+
 const app = express();
 app.use(cors());
 app.use(express.json()); 
