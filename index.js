@@ -174,7 +174,12 @@ const client = new Client({
             '--metrics-recording-only',
             '--mute-audio',
             '--safebrowsing-disable-auto-update'
-        ]
+        ],
+        // Essa box eh MUITO lenta pra rodar Chromium — o timeout padrao do protocolo
+        // (comunicacao interna Puppeteer <-> Chromium) e curto demais e estava estourando
+        // ("Runtime.callFunctionOn timed out") bem no meio da conexao inicial, antes do
+        // Chromium conseguir responder. Aumenta a margem pra 5 minutos.
+        protocolTimeout: 300000
     }
 });
 
