@@ -192,11 +192,21 @@ const client = new Client({
         // fica sem efeito e o Puppeteer tenta abrir um binário que a gente instruiu ele a não baixar.
         executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
         // Flags extras pensadas pra rodar num container com pouca memoria/CPU (a box
-        // Armbian tem só 787MB de RAM). Sem "--disable-dev-shm-usage" o Chromium tenta usar
-        // a memoria compartilhada /dev/shm do container, que por padrao no Docker vem
-        // limitada a so 64MB — quando enche, o Chromium fica instavel/lento e isso ja
-        // contribuiu pra travar a box inteira. As outras reduzem trabalho de fundo que a
-        // gente nao precisa (GPU, sync, extensões, telemetria).
+        // Armbian tem só 787MB de RAM, e o resto do sistema ja deixa quase nada livre).
+        // Sem "--disable-dev-shm-usage" o Chromium tenta usar a memoria compartilhada
+        // /dev/shm do container, que por padrao no Docker vem limitada a so 64MB — quando
+        // enche, o Chromium fica instavel/lento e isso ja contribuiu pra travar a box inteira.
+        // "--single-process" e o mais importante pro problema de OOM: sem ela, o Chromium
+        // sobe um processo "browser" + um ou mais processos "renderer" separados dentro do
+        // MESMO limite de memoria do container (mem_limit/memswap_limit no docker-compose).
+        // Confirmamos via dmesg que o kernel estava matando o renderer por estourar esse
+        // limite ("Memory cgroup out of memory... task=chromium"). Com "--single-process"
+        // tudo roda num processo so, cortando bastante o uso total de RAM (custa um pouco de
+        // isolamento entre "abas", irrelevante aqui — e so uma sessao do WhatsApp Web).
+        // "--js-flags=--max-old-space-size=256" limita o heap do V8 a 256MB pra evitar que o
+        // proprio Chromium tente crescer alem do que a box aguenta.
+        // As outras flags reduzem trabalho de fundo que a gente nao precisa (GPU, sync,
+        // extensões, telemetria).
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
@@ -205,6 +215,8 @@ const client = new Client({
             '--disable-gpu',
             '--no-first-run',
             '--no-zygote',
+            '--single-process',
+            '--js-flags=--max-old-space-size=256',
             '--disable-extensions',
             '--disable-background-networking',
             '--disable-default-apps',
