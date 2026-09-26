@@ -203,13 +203,15 @@ const client = new Client({
         // Sem "--disable-dev-shm-usage" o Chromium tenta usar a memoria compartilhada
         // /dev/shm do container, que por padrao no Docker vem limitada a so 64MB — quando
         // enche, o Chromium fica instavel/lento e isso ja contribuiu pra travar a box inteira.
-        // "--single-process" e o mais importante pro problema de OOM: sem ela, o Chromium
-        // sobe um processo "browser" + um ou mais processos "renderer" separados dentro do
-        // MESMO limite de memoria do container (mem_limit/memswap_limit no docker-compose).
-        // Confirmamos via dmesg que o kernel estava matando o renderer por estourar esse
-        // limite ("Memory cgroup out of memory... task=chromium"). Com "--single-process"
-        // tudo roda num processo so, cortando bastante o uso total de RAM (custa um pouco de
-        // isolamento entre "abas", irrelevante aqui — e so uma sessao do WhatsApp Web).
+        // Tentamos "--single-process" pra resolver o OOM (kernel matando o processo
+        // renderer do Chromium por estourar o limite de memoria do container, confirmado
+        // via dmesg: "Memory cgroup out of memory... task=chromium"). Só que essa flag
+        // NAO e bem suportada pelo Puppeteer — ela junta processo "browser" e "renderer"
+        // num so, o que bagunca o rastreio de navegacao/contexto via CDP e gerava, de
+        // forma 100% reproduzivel, "Execution context was destroyed, most likely because
+        // of a navigation" bem na injecao do script do whatsapp-web.js. Removida. A
+        // margem de swap (memswap_limit no docker-compose, 100MB acima do mem_limit) fica
+        // como colchao pros picos de memoria em vez de forcar processo unico.
         // "--js-flags=--max-old-space-size=256" limita o heap do V8 a 256MB pra evitar que o
         // proprio Chromium tente crescer alem do que a box aguenta.
         // As outras flags reduzem trabalho de fundo que a gente nao precisa (GPU, sync,
@@ -222,7 +224,6 @@ const client = new Client({
             '--disable-gpu',
             '--no-first-run',
             '--no-zygote',
-            '--single-process',
             '--js-flags=--max-old-space-size=256',
             '--disable-extensions',
             '--disable-background-networking',
