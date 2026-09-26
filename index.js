@@ -245,9 +245,11 @@ const client = new Client({
             '--disable-domain-reliability',
             '--disable-prompt-on-repost',
             '--disable-notifications',
-            '--disable-popup-blocking',
-            '--disk-cache-size=1',
-            '--media-cache-size=1'
+            '--disable-popup-blocking'
+            // Removidas '--disk-cache-size=1' e '--media-cache-size=1': suspeita forte de
+            // que forcar cache zerado estava causando um reload da pagina do WhatsApp Web
+            // bem no meio da injecao do script do whatsapp-web.js, gerando o erro
+            // "Execution context was destroyed, most likely because of a navigation."
         ],
         // Essa box eh MUITO lenta pra rodar Chromium — o timeout padrao do protocolo
         // (comunicacao interna Puppeteer <-> Chromium) e curto demais e estava estourando
