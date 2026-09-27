@@ -21,4 +21,13 @@ EXPOSE 3002
 # alguns cenários. Rodar o node direto como processo principal é mais simples e
 # também lida melhor com sinais de desligamento do container.
 ENTRYPOINT []
+
+# HEALTHCHECK (28/09/2026): bate na própria rota de status do bot a cada 30s. Sozinho
+# isso só faz o Docker MARCAR o container como "unhealthy" (visível em "docker ps") —
+# quem realmente reinicia é o serviço "autoheal" adicionado no docker-compose.yml, que
+# fica de olho em containers marcados assim e dá restart neles automaticamente. Usamos
+# "node -e" em vez de curl/wget porque essa imagem não tem nenhum dos dois instalado.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
+  CMD node -e "require('http').get('http://localhost:3001/api/bot/status', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"
+
 CMD ["node", "index.js"]

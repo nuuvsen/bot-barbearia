@@ -26,6 +26,23 @@ services:
     mem_limit: 300m
     memswap_limit: 300m
 
+  # 🩺 Autoheal (28/09/2026): o HEALTHCHECK sozinho (definido nos Dockerfiles do bot e
+  # do painel) só faz o Docker MARCAR um container como "unhealthy" — ele não reinicia
+  # nada por conta própria. Esse serviço é um "vigia" bem pequeno (~5MB) que fica de
+  # olho em TODO container do host que tenha HEALTHCHECK (AUTOHEAL_CONTAINER_LABEL=all,
+  # inclusive os de outros docker-compose, como o do painel) e dá um "docker restart"
+  # automático em qualquer um que ficar "unhealthy" — essencial numa TV Box fraca que
+  # já travou várias vezes e ninguém percebia na hora.
+  autoheal:
+    image: willfarrell/autoheal:latest
+    container_name: autoheal
+    restart: always
+    environment:
+      - AUTOHEAL_CONTAINER_LABEL=all
+      - AUTOHEAL_INTERVAL=10
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
 # Declaração do volume persistente
 volumes:
   bot_auth_data:
