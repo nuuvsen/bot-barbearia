@@ -41,6 +41,17 @@ let currentQrUrl = null;
 let botStatus = 'desconectado';
 const estadosUsuarios = {};
 
+// 📣 Progresso do disparo de campanha em massa — consultado pelo painel admin via
+// polling em /api/bot/campanha/status pra mostrar a barra de carregamento.
+let campanhaProgresso = {
+    emAndamento: false,
+    total: 0,
+    enviados: 0,
+    falhas: 0,
+    iniciadoEm: null,
+    finalizadoEm: null
+};
+
 // Função de pausa (delay) global para Anti-Ban
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -129,6 +140,13 @@ async function enviarPush({ destino, identificador, titulo, corpo }) {
 let botConfig = {
     lembretesAtivos: true,
     horarios: ['09:00', '18:00'],
+    // 🕐 Aviso por antecedência (28/09/2026): além dos horários fixos acima (que avisam
+    // TODOS os agendamentos pendentes do dia de uma vez, nos horários marcados), este é
+    // um segundo mecanismo independente — avisa CADA cliente individualmente, contando
+    // pra trás a partir do horário do próprio corte dele (ex: 60 = avisa 1h antes de
+    // cada agendamento, não importa a que horas ele seja).
+    lembreteAntecedenciaAtivo: false,
+    lembreteAntecedenciaMinutos: 60,
     msgConfirmacao: '✅ *Olá, {nome}!* Seu agendamento foi confirmado com sucesso!\n\n✂️ *Serviço:* {servico}\n📅 *Data:* {data}\n⏰ *Horário:* {hora}\n💈 *Profissional:* {barbeiro}\n\nTe esperamos na Barbearia Antunes!',
     msgLembrete: '⏰ *Olá, {nome}!* Passando para lembrar do seu agendamento hoje às *{hora}* na Barbearia Antunes.\n\nCaso não possa comparecer, responda *Menu* e selecione cancelar.',
 
@@ -982,6 +1000,9 @@ app.post('/api/bot/campanha', async (req, res) => {
     if (botStatus !== 'conectado') {
         return res.status(400).json({ error: 'O Bot precisa estar conectado ao WhatsApp.' });
     }
+    if (campanhaProgresso.emAndamento) {
+        return res.status(409).json({ error: 'Já existe um disparo em andamento. Aguarde ele terminar antes de iniciar outro.' });
+    }
 
     res.json({ success: true, message: 'Disparo iniciado em background.' });
 
@@ -992,6 +1013,15 @@ app.post('/api/bot/campanha', async (req, res) => {
         clientesSnap.forEach(doc => clientes.push(doc.data()));
 
         console.log(`📣 Iniciando disparo em massa para ${clientes.length} clientes cadastrados.`);
+
+        campanhaProgresso = {
+            emAndamento: true,
+            total: clientes.length,
+            enviados: 0,
+            falhas: 0,
+            iniciadoEm: new Date().toISOString(),
+            finalizadoEm: null
+        };
 
         for (const cliente of clientes) {
             const primeiroNome = cliente.nome ? cliente.nome.split(' ')[0] : 'Cliente';
@@ -1023,79 +1053,124 @@ app.post('/api/bot/campanha', async (req, res) => {
                     await enviarMensagem(jidValido, msgFormatada);
                     console.log(`✅ [Campanha] Mensagem enviada para ${primeiroNome} (${numeroUsado})`);
 
+                    campanhaProgresso.enviados++;
+
                     const tempoEspera = Math.floor(Math.random() * (10000 - 5000 + 1)) + 5000;
                     await delay(tempoEspera);
                 } catch (err) {
                     console.error(`❌ Erro ao enviar campanha para ${primeiroNome}:`, err.message);
+                    campanhaProgresso.falhas++;
                 }
             } else {
                 console.log(`⚠️ [Ignorado] Não foi possível encontrar um WhatsApp válido para ${primeiroNome}.`);
+                campanhaProgresso.falhas++;
             }
         }
         console.log('🏁 Disparo de Campanha finalizado com sucesso!');
     } catch (error) {
         console.error('❌ Erro na rotina de campanha:', error);
+    } finally {
+        campanhaProgresso.emAndamento = false;
+        campanhaProgresso.finalizadoEm = new Date().toISOString();
     }
+});
+
+// Consultado pelo painel admin via polling pra mostrar a barra de progresso do disparo
+// (total de clientes, quantos já foram tentados, quantos falharam).
+app.get('/api/bot/campanha/status', (req, res) => {
+    res.json(campanhaProgresso);
 });
 
 // =====================================================================
 // ⏰ CRON JOB 1: LEMBRETES DIÁRIOS DOS AGENDAMENTOS DO DIA
 // =====================================================================
 cron.schedule('* * * * *', async () => {
-    if (!botConfig.lembretesAtivos || botStatus !== 'conectado') return;
+    if (botStatus !== 'conectado') return;
+
+    const antecedenciaLigada = botConfig.lembreteAntecedenciaAtivo && botConfig.lembreteAntecedenciaMinutos > 0;
+    if (!botConfig.lembretesAtivos && !antecedenciaLigada) return;
 
     const agora = new Date();
     const options = { timeZone: 'America/Sao_Paulo', hour: '2-digit', minute: '2-digit', hour12: false };
     const horaAtual = agora.toLocaleTimeString('pt-BR', options);
+    const [hAtual, mAtual] = horaAtual.split(':').map(Number);
+    const minutosAgora = hAtual * 60 + mAtual;
 
-    if (botConfig.horarios.includes(horaAtual)) {
+    const disparoPorHorarioFixo = botConfig.lembretesAtivos && botConfig.horarios.includes(horaAtual);
+
+    // Se não é um dos horários fixos configurados E o aviso por antecedência está
+    // desligado, não tem nem por que consultar o Firestore neste minuto.
+    if (!disparoPorHorarioFixo && !antecedenciaLigada) return;
+
+    if (disparoPorHorarioFixo) {
         console.log(`⏳ Iniciando rotina de lembretes para as ${horaAtual}...`);
+    }
 
-        try {
-            const dataHoje = agora.toISOString().split('T')[0];
+    try {
+        const dataHoje = agora.toISOString().split('T')[0];
 
-            const snap = await db.collection('agendamentos')
-                .where('data', '==', dataHoje)
-                .where('status', '==', 'Pendente')
-                .get();
+        const snap = await db.collection('agendamentos')
+            .where('data', '==', dataHoje)
+            .where('status', '==', 'Pendente')
+            .get();
 
-            snap.forEach(async (doc) => {
-                const agenda = doc.data();
-                const tel = agenda.clienteTelefone;
+        snap.forEach(async (doc) => {
+            const agenda = doc.data();
+            const tel = agenda.clienteTelefone;
+            const horarioCorte = agenda.hora || agenda.horario;
 
-                try {
-                    let numeroPuro = tel.replace(/\D/g, '');
-                    if (!numeroPuro.startsWith('55')) numeroPuro = '55' + numeroPuro;
-
-                    const jidValido = await obterJidValido(numeroPuro);
-                    if (jidValido) {
-                        const primeiroNome = agenda.clienteNome ? agenda.clienteNome.split(' ')[0] : 'Cliente';
-                        const horarioCorte = agenda.hora || agenda.horario;
-
-                        let msgLembrete = botConfig.msgLembrete
-                            .replace(/{nome}/g, primeiroNome)
-                            .replace(/{hora}/g, horarioCorte);
-
-                        await enviarMensagem(jidValido, msgLembrete);
-                        console.log(`✅ Lembrete enviado para ${primeiroNome}`);
+            // 🕐 Aviso por antecedência: dispara uma única vez, no minuto exato em que
+            // faltam "lembreteAntecedenciaMinutos" pro horário do corte DESSE cliente —
+            // marcamos lembreteAntecedenciaEnviado no próprio agendamento pra nunca
+            // repetir (mesmo que o container reinicie no meio do dia).
+            let disparoPorAntecedencia = false;
+            if (antecedenciaLigada && horarioCorte && !agenda.lembreteAntecedenciaEnviado) {
+                const [hCorte, mCorte] = horarioCorte.split(':').map(Number);
+                if (!isNaN(hCorte) && !isNaN(mCorte)) {
+                    const minutosCorte = hCorte * 60 + mCorte;
+                    if ((minutosCorte - minutosAgora) === botConfig.lembreteAntecedenciaMinutos) {
+                        disparoPorAntecedencia = true;
                     }
-
-                    // Também manda o lembrete como notificação push, pra quem tiver o app
-                    // instalado com notificações ativadas — independe do WhatsApp ter
-                    // reconhecido o número ou não.
-                    enviarPush({
-                        destino: 'cliente',
-                        identificador: tel,
-                        titulo: 'Lembrete de horário ⏰',
-                        corpo: `Seu corte hoje é às ${agenda.hora || agenda.horario} na Barbearia Antunes.`
-                    }).catch(e => console.error('Erro ao notificar cliente (lembrete):', e));
-                } catch (e) {
-                    console.error(`❌ Erro ao enviar lembrete para ${agenda.clienteTelefone}:`, e);
                 }
-            });
-        } catch (error) {
-            console.error('❌ Erro na rotina de lembretes:', error);
-        }
+            }
+
+            if (!disparoPorHorarioFixo && !disparoPorAntecedencia) return;
+
+            try {
+                let numeroPuro = tel.replace(/\D/g, '');
+                if (!numeroPuro.startsWith('55')) numeroPuro = '55' + numeroPuro;
+
+                const jidValido = await obterJidValido(numeroPuro);
+                if (jidValido) {
+                    const primeiroNome = agenda.clienteNome ? agenda.clienteNome.split(' ')[0] : 'Cliente';
+
+                    let msgLembrete = botConfig.msgLembrete
+                        .replace(/{nome}/g, primeiroNome)
+                        .replace(/{hora}/g, horarioCorte);
+
+                    await enviarMensagem(jidValido, msgLembrete);
+                    console.log(`✅ Lembrete enviado para ${primeiroNome}${disparoPorAntecedencia ? ` (${botConfig.lembreteAntecedenciaMinutos}min de antecedência)` : ''}`);
+                }
+
+                // Também manda o lembrete como notificação push, pra quem tiver o app
+                // instalado com notificações ativadas — independe do WhatsApp ter
+                // reconhecido o número ou não.
+                enviarPush({
+                    destino: 'cliente',
+                    identificador: tel,
+                    titulo: 'Lembrete de horário ⏰',
+                    corpo: `Seu corte hoje é às ${horarioCorte} na Barbearia Antunes.`
+                }).catch(e => console.error('Erro ao notificar cliente (lembrete):', e));
+
+                if (disparoPorAntecedencia) {
+                    await doc.ref.update({ lembreteAntecedenciaEnviado: true }).catch(e => console.error('Erro ao marcar lembrete por antecedência como enviado:', e));
+                }
+            } catch (e) {
+                console.error(`❌ Erro ao enviar lembrete para ${agenda.clienteTelefone}:`, e);
+            }
+        });
+    } catch (error) {
+        console.error('❌ Erro na rotina de lembretes:', error);
     }
 });
 
