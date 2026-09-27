@@ -1,10 +1,11 @@
-FROM node:18-slim
+FROM node:20-slim
 
 # Migração whatsapp-web.js -> Baileys (27/09/2026): o Baileys se conecta direto ao
 # WhatsApp via WebSocket, sem abrir navegador nenhum — não precisamos mais instalar
 # Chromium (nem ca-certificates/fonts que eram só pra ele) nessa imagem. Isso sozinho
 # já tira ~300MB da imagem e elimina de vez o maior consumidor de RAM/CPU do container,
-# essencial numa TV Box Armbian com só 787MB de RAM total.
+# essencial numa TV Box Armbian com só 787MB de RAM total. Node 20+ (em vez do 18
+# anterior) porque o Baileys exige >=20.0.0 pra rodar de forma confiavel.
 
 WORKDIR /usr/src/app
 
