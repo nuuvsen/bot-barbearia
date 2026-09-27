@@ -49,8 +49,12 @@ let campanhaProgresso = {
     enviados: 0,
     falhas: 0,
     iniciadoEm: null,
-    finalizadoEm: null
+    finalizadoEm: null,
+    cancelada: false
 };
+// Verificada a cada cliente, dentro do loop de disparo — permite cancelar um disparo
+// já em andamento sem precisar reiniciar o container inteiro.
+let campanhaCancelamentoSolicitado = false;
 
 // Função de pausa (delay) global para Anti-Ban
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -992,7 +996,12 @@ app.post('/api/bot/lista-espera', async (req, res) => {
 // 📣 DISPARO EM MASSA (MARKETING E CAMPANHAS)
 // =====================================================================
 app.post('/api/bot/campanha', async (req, res) => {
-    const { mensagem } = req.body;
+    // "clientes" (opcional): lista já filtrada pelo painel — ex: só clientes com um
+    // plano específico, ou com X+ cortes, ou cadastrados há mais de Y dias (a lógica de
+    // segmentação mora no painel, que já tem acesso direto ao Firestore pra isso; aqui a
+    // gente só dispara pra quem foi mandado). Sem essa lista, mantém o comportamento
+    // antigo: todos os clientes cadastrados.
+    const { mensagem, clientes: listaFiltrada } = req.body;
 
     if (!mensagem) {
         return res.status(400).json({ error: 'A mensagem não pode estar vazia.' });
@@ -1005,14 +1014,20 @@ app.post('/api/bot/campanha', async (req, res) => {
     }
 
     res.json({ success: true, message: 'Disparo iniciado em background.' });
+    campanhaCancelamentoSolicitado = false;
 
     try {
-        console.log('📣 Buscando clientes para o disparo em massa...');
-        const clientesSnap = await db.collection('clientes').get();
-        const clientes = [];
-        clientesSnap.forEach(doc => clientes.push(doc.data()));
-
-        console.log(`📣 Iniciando disparo em massa para ${clientes.length} clientes cadastrados.`);
+        let clientes;
+        if (Array.isArray(listaFiltrada) && listaFiltrada.length > 0) {
+            clientes = listaFiltrada;
+            console.log(`📣 Iniciando disparo segmentado para ${clientes.length} cliente(s) selecionado(s).`);
+        } else {
+            console.log('📣 Buscando clientes para o disparo em massa...');
+            const clientesSnap = await db.collection('clientes').get();
+            clientes = [];
+            clientesSnap.forEach(doc => clientes.push(doc.data()));
+            console.log(`📣 Iniciando disparo em massa para ${clientes.length} clientes cadastrados.`);
+        }
 
         campanhaProgresso = {
             emAndamento: true,
@@ -1020,10 +1035,16 @@ app.post('/api/bot/campanha', async (req, res) => {
             enviados: 0,
             falhas: 0,
             iniciadoEm: new Date().toISOString(),
-            finalizadoEm: null
+            finalizadoEm: null,
+            cancelada: false
         };
 
         for (const cliente of clientes) {
+            if (campanhaCancelamentoSolicitado) {
+                console.log('🛑 Disparo de campanha cancelado pelo painel.');
+                campanhaProgresso.cancelada = true;
+                break;
+            }
             const primeiroNome = cliente.nome ? cliente.nome.split(' ')[0] : 'Cliente';
 
             let jidValido = null;
@@ -1066,12 +1087,15 @@ app.post('/api/bot/campanha', async (req, res) => {
                 campanhaProgresso.falhas++;
             }
         }
-        console.log('🏁 Disparo de Campanha finalizado com sucesso!');
+        if (!campanhaProgresso.cancelada) {
+            console.log('🏁 Disparo de Campanha finalizado com sucesso!');
+        }
     } catch (error) {
         console.error('❌ Erro na rotina de campanha:', error);
     } finally {
         campanhaProgresso.emAndamento = false;
         campanhaProgresso.finalizadoEm = new Date().toISOString();
+        campanhaCancelamentoSolicitado = false;
     }
 });
 
@@ -1079,6 +1103,46 @@ app.post('/api/bot/campanha', async (req, res) => {
 // (total de clientes, quantos já foram tentados, quantos falharam).
 app.get('/api/bot/campanha/status', (req, res) => {
     res.json(campanhaProgresso);
+});
+
+// Cancela um disparo em andamento — o loop acima verifica essa flag a cada cliente, então
+// a interrupção acontece assim que o envio (e a pausa anti-ban) do cliente atual terminar.
+app.post('/api/bot/campanha/cancelar', (req, res) => {
+    if (!campanhaProgresso.emAndamento) {
+        return res.status(400).json({ error: 'Não há nenhum disparo em andamento pra cancelar.' });
+    }
+    campanhaCancelamentoSolicitado = true;
+    res.json({ success: true, message: 'Cancelamento solicitado — o disparo vai parar após o envio atual.' });
+});
+
+// Envia a mensagem da campanha só pra UM número (o do próprio admin, por exemplo), pra
+// revisar o texto de verdade antes de disparar pra todos os clientes. Não mexe em
+// campanhaProgresso nem exige que nenhum outro disparo esteja parado — é só um envio
+// avulso e imediato.
+app.post('/api/bot/campanha/teste', async (req, res) => {
+    const { mensagem, numeroTeste } = req.body;
+
+    if (!mensagem) return res.status(400).json({ error: 'A mensagem não pode estar vazia.' });
+    if (!numeroTeste) return res.status(400).json({ error: 'Informe um número de WhatsApp para o teste.' });
+    if (botStatus !== 'conectado') return res.status(400).json({ error: 'O Bot precisa estar conectado ao WhatsApp.' });
+
+    try {
+        let numPuro = numeroTeste.toString().replace(/\D/g, '');
+        if (!numPuro.startsWith('55') && numPuro.length >= 10) numPuro = '55' + numPuro;
+
+        const jidValido = await obterJidValido(numPuro);
+        if (!jidValido) {
+            return res.status(400).json({ error: 'Não encontrei esse número no WhatsApp. Confira o DDD e tente de novo.' });
+        }
+
+        const msgFormatada = mensagem.replace(/{nome}/g, 'Teste');
+        await enviarMensagem(jidValido, msgFormatada);
+        console.log(`🧪 [Teste de Campanha] Mensagem de teste enviada para ${numPuro}`);
+        res.json({ success: true, message: 'Mensagem de teste enviada!' });
+    } catch (error) {
+        console.error('❌ Erro ao enviar mensagem de teste:', error);
+        res.status(500).json({ error: 'Erro ao enviar a mensagem de teste.' });
+    }
 });
 
 // =====================================================================
