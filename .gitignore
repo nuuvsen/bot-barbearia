@@ -1,6 +1,7 @@
 node_modules
 .wwebjs_auth
 .wwebjs_cache
+baileys_auth
 .env
 
 # Chave de serviço do Firebase — é uma credencial real, nunca deve ir pro Git.

@@ -8,8 +8,10 @@ services:
     ports:
       - "3002:3001" # Evita o conflito da porta 3001 que você teve anteriormente
     volumes:
-      # Isso salva a sessão do WhatsApp de forma persistente através do Docker
-      - bot_auth_data:/usr/src/app/.wwebjs_auth
+      # Isso salva a sessão do WhatsApp de forma persistente através do Docker. Pasta
+      # nova (baileys_auth) porque migramos do whatsapp-web.js pro Baileys — a sessão
+      # antiga (.wwebjs_auth) não é compatível com o formato do Baileys.
+      - bot_auth_data:/usr/src/app/baileys_auth
     environment:
       # A porta que o Express vai rodar dentro do container
       - PORT=3001
@@ -18,6 +20,11 @@ services:
     restart: always
     networks:
       - barbearia-net
+    cpus: 2.0
+    # Baileys não abre navegador (sem Chromium) — consumo de RAM cai de ~400MB pra
+    # ~30-50MB. 300MB de teto dá bastante folga sem precisar de swap nenhuma.
+    mem_limit: 300m
+    memswap_limit: 300m
 
 # Declaração do volume persistente
 volumes:

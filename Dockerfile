@@ -1,22 +1,10 @@
 FROM node:18-slim
 
-# Evita baixar o Chromium duas vezes: o pacote "chromium" do Debian abaixo já instala um
-# Chromium completo e funcional, então avisamos o Puppeteer (usado por baixo do
-# whatsapp-web.js) pra NAO baixar o dele próprio — era esse download duplicado (~300MB)
-# que estava estourando o disco e derrubando o build com "ENOSPC: no space left on device".
-ENV PUPPETEER_SKIP_DOWNLOAD=true
-ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
-
-# Instala só o essencial pro Chromium do sistema rodar. O pacote "chromium" já traz consigo,
-# via dependências do apt, as bibliotecas que ele precisa (libnss3, libgbm1, etc.) — não
-# precisa listar tudo de novo. Também tiramos as fontes de idiomas que não usamos aqui
-# (chinês, tailandês, árabe...) pra economizar espaço.
-RUN apt-get update && apt-get install -y \
-    chromium \
-    fonts-liberation \
-    ca-certificates \
-    --no-install-recommends \
-    && rm -rf /var/lib/apt/lists/*
+# Migração whatsapp-web.js -> Baileys (27/09/2026): o Baileys se conecta direto ao
+# WhatsApp via WebSocket, sem abrir navegador nenhum — não precisamos mais instalar
+# Chromium (nem ca-certificates/fonts que eram só pra ele) nessa imagem. Isso sozinho
+# já tira ~300MB da imagem e elimina de vez o maior consumidor de RAM/CPU do container,
+# essencial numa TV Box Armbian com só 787MB de RAM total.
 
 WORKDIR /usr/src/app
 

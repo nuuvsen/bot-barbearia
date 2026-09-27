@@ -1,6 +1,26 @@
 const express = require('express');
 const cors = require('cors');
-const { Client, LocalAuth } = require('whatsapp-web.js');
+// =====================================================================
+// 🔁 MIGRAÇÃO whatsapp-web.js -> Baileys (27/09/2026)
+// -----------------------------------------------------------------------
+// O whatsapp-web.js (e qualquer biblioteca baseada nele) abre um Chromium de verdade
+// via Puppeteer só pra "fingir" ser um navegador rodando o WhatsApp Web. Nessa TV Box
+// Armbian (787MB de RAM, 4 núcleos fracos), isso sozinho já consumia 300-450MB de RAM e
+// boa parte da CPU, e ainda por cima esbarramos num bug conhecido e ainda aberto na
+// própria biblioteca ("Execution context was destroyed" — ver commits anteriores) que
+// não tinha correção definitiva.
+// O Baileys (@whiskeysockets/baileys) não abre navegador nenhum: ele se conecta direto
+// no WhatsApp via WebSocket, do mesmo jeito que o app oficial faz por baixo dos panos.
+// Consumo de RAM cai de ~400MB pra ~30-50MB, e o bug do Puppeteer deixa de existir por
+// completo (não tem mais Chromium pra travar/crashar). É uma sessão NOVA — precisa
+// escanear o QR de novo, a sessão antiga do whatsapp-web.js não é compatível.
+const {
+    default: makeWASocket,
+    useMultiFileAuthState,
+    DisconnectReason,
+    fetchLatestBaileysVersion
+} = require('@whiskeysockets/baileys');
+const pino = require('pino');
 const qrcode = require('qrcode');
 // firebase.js exporta o Firestore direto (module.exports = db), não como { db } —
 // desestruturar aqui deixava "db" undefined e quebrava toda chamada db.collection(...).
@@ -11,48 +31,11 @@ const cron = require('node-cron');
 // também dá acesso a admin.messaging() (notificações push), que db (só o Firestore) não tem.
 const admin = require('firebase-admin');
 
-const fs = require('fs');
 const path = require('path');
-
-// Remove locks do Chromium que sobraram de uma sessao anterior que nao fechou direito
-// (crash, "docker stop" forcado, a box travando). Sem isso, o Chromium as vezes se
-// recusa a abrir de novo achando que ainda tem outro processo usando o mesmo profile
-// ("Failed to launch the browser process... Chromium has locked the profile") e fica
-// preso nesse erro pra sempre, em vez de so acontecer uma vez e se resolver sozinho.
-// Roda isso ANTES de criar o Client, toda vez que o processo sobe.
-function limparLocksChromiumAntigos() {
-    const dirAuth = path.join(__dirname, '.wwebjs_auth');
-    if (!fs.existsSync(dirAuth)) return;
-
-    const pilha = [dirAuth];
-    while (pilha.length) {
-        const dirAtual = pilha.pop();
-        let entradas;
-        try {
-            entradas = fs.readdirSync(dirAtual, { withFileTypes: true });
-        } catch (erro) {
-            continue;
-        }
-        for (const entrada of entradas) {
-            const caminhoCompleto = path.join(dirAtual, entrada.name);
-            if (entrada.isDirectory()) {
-                pilha.push(caminhoCompleto);
-            } else if (/^Singleton(Lock|Cookie|Socket)$/i.test(entrada.name)) {
-                try {
-                    fs.unlinkSync(caminhoCompleto);
-                    console.log('🧹 Removido lock antigo do Chromium:', caminhoCompleto);
-                } catch (erro) {
-                    console.error('Não consegui remover lock antigo:', caminhoCompleto, erro.message);
-                }
-            }
-        }
-    }
-}
-limparLocksChromiumAntigos();
 
 const app = express();
 app.use(cors());
-app.use(express.json()); 
+app.use(express.json());
 
 let currentQrUrl = null;
 let botStatus = 'desconectado';
@@ -148,7 +131,7 @@ let botConfig = {
     horarios: ['09:00', '18:00'],
     msgConfirmacao: '✅ *Olá, {nome}!* Seu agendamento foi confirmado com sucesso!\n\n✂️ *Serviço:* {servico}\n📅 *Data:* {data}\n⏰ *Horário:* {hora}\n💈 *Profissional:* {barbeiro}\n\nTe esperamos na Barbearia Antunes!',
     msgLembrete: '⏰ *Olá, {nome}!* Passando para lembrar do seu agendamento hoje às *{hora}* na Barbearia Antunes.\n\nCaso não possa comparecer, responda *Menu* e selecione cancelar.',
-    
+
     // Configurações do Radar
     radarAtivo: false,
     radarDias: 45,
@@ -184,108 +167,129 @@ async function testarConexaoFirebase() {
 }
 testarConexaoFirebase();
 
-const client = new Client({
-    authStrategy: new LocalAuth(),
-    // O padrao do whatsapp-web.js pra "authTimeoutMs" e so 45 segundos — tempo entre o
-    // celular escanear o QR e o handshake de autenticacao terminar. Nessa box, com o
-    // Chromium disputando CPU (load average tem passado de 7 num box de 4 nucleos fracos),
-    // esse handshake pode demorar mais que isso e o processo derruba a sessao com
-    // "reason: auth timeout" logo apos o QR ser lido — foi o que apareceu no log. Aumenta
-    // pra 5 minutos, mesma margem do protocolTimeout do Puppeteer abaixo.
-    authTimeoutMs: 300000,
-    puppeteer: {
-        // Em produção (Docker), aponta pro Chromium instalado via apt no Dockerfile em vez
-        // de baixar/usar o Chromium embutido do Puppeteer. Sem isso, o PUPPETEER_EXECUTABLE_PATH
-        // fica sem efeito e o Puppeteer tenta abrir um binário que a gente instruiu ele a não baixar.
-        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-        // Flags extras pensadas pra rodar num container com pouca memoria/CPU (a box
-        // Armbian tem só 787MB de RAM, e o resto do sistema ja deixa quase nada livre).
-        // Sem "--disable-dev-shm-usage" o Chromium tenta usar a memoria compartilhada
-        // /dev/shm do container, que por padrao no Docker vem limitada a so 64MB — quando
-        // enche, o Chromium fica instavel/lento e isso ja contribuiu pra travar a box inteira.
-        // Tentamos "--single-process" pra resolver o OOM (kernel matando o processo
-        // renderer do Chromium por estourar o limite de memoria do container, confirmado
-        // via dmesg: "Memory cgroup out of memory... task=chromium"). Só que essa flag
-        // NAO e bem suportada pelo Puppeteer — ela junta processo "browser" e "renderer"
-        // num so, o que bagunca o rastreio de navegacao/contexto via CDP e gerava, de
-        // forma 100% reproduzivel, "Execution context was destroyed, most likely because
-        // of a navigation" bem na injecao do script do whatsapp-web.js. Removida. A
-        // margem de swap (memswap_limit no docker-compose, 100MB acima do mem_limit) fica
-        // como colchao pros picos de memoria em vez de forcar processo unico.
-        // "--js-flags=--max-old-space-size=256" limita o heap do V8 a 256MB pra evitar que o
-        // proprio Chromium tente crescer alem do que a box aguenta.
-        // As outras flags reduzem trabalho de fundo que a gente nao precisa (GPU, sync,
-        // extensões, telemetria).
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-accelerated-2d-canvas',
-            '--disable-gpu',
-            '--no-first-run',
-            '--no-zygote',
-            '--js-flags=--max-old-space-size=256',
-            '--disable-extensions',
-            '--disable-background-networking',
-            '--disable-default-apps',
-            '--disable-sync',
-            '--disable-translate',
-            '--metrics-recording-only',
-            '--mute-audio',
-            '--safebrowsing-disable-auto-update',
-            // Reduz mais ainda trabalho de fundo/CPU (timers, hang monitor, IPC throttling)
-            // e some com o cache em disco do Chromium — a box roda de cartao/eMMC lento e
-            // o cache gerava espera de I/O (processo aparecendo em estado "D" no htop).
-            '--disable-background-timer-throttling',
-            '--disable-backgrounding-occluded-windows',
-            '--disable-renderer-backgrounding',
-            '--disable-ipc-flooding-protection',
-            '--disable-hang-monitor',
-            '--disable-client-side-phishing-detection',
-            '--disable-component-update',
-            '--disable-domain-reliability',
-            '--disable-prompt-on-repost',
-            '--disable-notifications',
-            '--disable-popup-blocking'
-            // Removidas '--disk-cache-size=1' e '--media-cache-size=1': suspeita forte de
-            // que forcar cache zerado estava causando um reload da pagina do WhatsApp Web
-            // bem no meio da injecao do script do whatsapp-web.js, gerando o erro
-            // "Execution context was destroyed, most likely because of a navigation."
-        ],
-        // Essa box eh MUITO lenta pra rodar Chromium — o timeout padrao do protocolo
-        // (comunicacao interna Puppeteer <-> Chromium) e curto demais e estava estourando
-        // ("Runtime.callFunctionOn timed out") bem no meio da conexao inicial, antes do
-        // Chromium conseguir responder. Aumenta a margem pra 5 minutos.
-        protocolTimeout: 300000
+// =====================================================================
+// 📡 CONEXÃO COM O WHATSAPP (Baileys)
+// =====================================================================
+// "sock" é reatribuído a cada (re)conexão — nunca guarde uma referência antiga em outra
+// variável, sempre acesse via "sock" na hora de usar (é assim que o Reiniciar Bot e a
+// reconexão automática conseguem trocar a conexão por baixo sem quebrar o resto do código.
+let sock = null;
+let reiniciandoBot = false;
+
+async function iniciarSock() {
+    // Sessão persistida em disco (equivalente ao LocalAuth do whatsapp-web.js), num volume
+    // Docker próprio — pasta nova porque a sessão antiga (.wwebjs_auth) é de outra
+    // biblioteca e não é compatível.
+    const { state, saveCreds } = await useMultiFileAuthState(path.join(__dirname, 'baileys_auth'));
+    const { version } = await fetchLatestBaileysVersion();
+
+    sock = makeWASocket({
+        version,
+        auth: state,
+        // Baileys por padrão loga bastante coisa técnica (pacotes, handshake, etc.) — silenciamos,
+        // já temos nossos próprios console.log nos pontos que importam pro painel/operação.
+        logger: pino({ level: 'silent' }),
+        // Nome que aparece em "Aparelhos Conectados" no WhatsApp do celular.
+        browser: ['Barbearia Antunes', 'Chrome', '120.0.0']
+    });
+
+    sock.ev.on('creds.update', saveCreds);
+
+    sock.ev.on('connection.update', (update) => {
+        const { connection, lastDisconnect, qr } = update;
+
+        if (qr) {
+            console.log('QR Code recebido. Aguardando leitura...');
+            botStatus = 'aguardando_qr';
+            qrcode.toDataURL(qr)
+                .then(url => { currentQrUrl = url; })
+                .catch(erro => console.error('Erro ao gerar imagem do QR Code:', erro));
+        }
+
+        if (connection === 'open') {
+            console.log('Bot conectado ao WhatsApp e pronto!');
+            botStatus = 'conectado';
+            currentQrUrl = null;
+        }
+
+        if (connection === 'close') {
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            const foiLogout = statusCode === DisconnectReason.loggedOut;
+            console.log('Bot desconectado. Motivo:', statusCode || lastDisconnect?.error?.message || 'desconhecido');
+            botStatus = 'desconectado';
+            currentQrUrl = null;
+
+            // Se foi um "Reiniciar Bot" manual (painel admin), quem cuida de chamar
+            // iniciarSock() de novo é a própria rota /api/bot/reiniciar — não faz duplicado aqui.
+            if (reiniciandoBot) return;
+
+            // "loggedOut" é quando o usuário removeu o aparelho pelo celular (WhatsApp > Aparelhos
+            // Conectados > Sair) — nesse caso a sessão salva não serve mais, mas ainda vale a pena
+            // tentar de novo: o Baileys já gera um QR Code novo sozinho quando as credenciais salvas
+            // não são mais válidas.
+            console.log('🔁 Tentando reconectar automaticamente' + (foiLogout ? ' (sessão encerrada, será necessário escanear um novo QR)' : '') + '...');
+            iniciarSock().catch(erro => console.error('❌ Erro ao tentar reconectar:', erro));
+        }
+    });
+
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+        // "notify" = mensagem nova de verdade. Outros tipos (ex: "append") aparecem durante a
+        // sincronização do histórico logo após conectar — não são mensagens novas do usuário.
+        if (type !== 'notify') return;
+
+        const msg = messages[0];
+        if (!msg || msg.key.fromMe) return;
+
+        const remoteJid = msg.key.remoteJid;
+        if (!remoteJid || remoteJid.endsWith('@g.us') || remoteJid === 'status@broadcast') return;
+
+        const texto = extrairTexto(msg);
+        if (!texto) return; // mensagem sem texto (figurinha, reação, etc.) — nada a processar
+
+        try {
+            await processarMensagem(msg, remoteJid, texto);
+        } catch (erro) {
+            console.error('❌ Erro inesperado ao processar mensagem:', erro);
+        }
+    });
+
+    return sock;
+}
+
+// Extrai o texto de uma mensagem do Baileys, desembrulhando mensagens efêmeras
+// ("apagar após X tempo") quando necessário. Cobre os tipos de mensagem que interessam
+// pro bot (texto simples, texto com formatação/link, legenda de foto/vídeo).
+function extrairTexto(msg) {
+    let conteudo = msg.message;
+    if (!conteudo) return '';
+    if (conteudo.ephemeralMessage) conteudo = conteudo.ephemeralMessage.message;
+    if (!conteudo) return '';
+
+    return conteudo.conversation
+        || conteudo.extendedTextMessage?.text
+        || conteudo.imageMessage?.caption
+        || conteudo.videoMessage?.caption
+        || '';
+}
+
+// Confirma se um número tem WhatsApp ativo e devolve o JID pra usar em sendMessage —
+// equivalente ao client.getNumberId(...)._serialized do whatsapp-web.js.
+async function obterJidValido(numeroPuro) {
+    if (!sock) return null;
+    try {
+        const resultados = await sock.onWhatsApp(numeroPuro);
+        const encontrado = resultados && resultados[0];
+        return (encontrado && encontrado.exists) ? encontrado.jid : null;
+    } catch (erro) {
+        console.error('Erro ao verificar número no WhatsApp:', erro.message);
+        return null;
     }
-});
+}
 
-client.on('qr', async (qr) => {
-    console.log('QR Code recebido. Aguardando leitura...');
-    botStatus = 'aguardando_qr';
-    currentQrUrl = await qrcode.toDataURL(qr); 
-});
-
-client.on('ready', () => {
-    console.log('Bot conectado ao WhatsApp e pronto!');
-    botStatus = 'conectado';
-    currentQrUrl = null;
-});
-
-client.on('disconnected', (reason) => {
-    console.log('Bot desconectado:', reason);
-    botStatus = 'desconectado';
-
-    // Se a desconexao nao veio de um "Reiniciar Bot" manual pelo painel (que ja cuida
-    // do seu proprio destroy+initialize logo abaixo), tenta reconectar sozinho. Cobre
-    // o caso comum de "LOGOUT" (sessao cai por causa do bug conhecido do whatsapp-web.js
-    // durante a inicializacao, ver comentario em inicializarClientComRetry) sem precisar
-    // o administrador clicar em "Reiniciar Bot" manualmente toda vez.
-    if (!reiniciandoBot) {
-        console.log('🔁 Tentando reconectar automaticamente apos desconexao...');
-        inicializarClientComRetry();
-    }
-});
+// Atalho pra mandar texto simples — equivalente ao client.sendMessage(chatId, texto).
+async function enviarMensagem(jid, texto) {
+    return sock.sendMessage(jid, { text: texto });
+}
 
 function limparNumeroDigitado(texto) {
     return texto.replace(/\D/g, '');
@@ -371,9 +375,9 @@ async function tentarProximoDaFila(barbeiro, data, hora) {
         try {
             let numeroPuro = String(candidato.telefone).replace(/\D/g, '');
             if (!numeroPuro.startsWith('55')) numeroPuro = '55' + numeroPuro;
-            const contatoValido = await client.getNumberId(numeroPuro);
+            const jidValido = await obterJidValido(numeroPuro);
 
-            if (contatoValido) {
+            if (jidValido) {
                 const primeiroNome = candidato.nome ? candidato.nome.split(' ')[0] : 'Cliente';
                 const [ano, mes, dia] = String(data || '').split('-');
                 const dataFormatada = (ano && mes && dia) ? `${dia}/${mes}/${ano}` : data;
@@ -385,7 +389,7 @@ async function tentarProximoDaFila(barbeiro, data, hora) {
                     .replace(/{hora}/g, hora)
                     .replace(/{barbeiro}/g, barbeiro);
 
-                await client.sendMessage(contatoValido._serialized, mensagem);
+                await enviarMensagem(jidValido, mensagem);
 
                 estadosUsuarios[numeroPuro] = {
                     etapa: 'aguardando_confirmacao_espera',
@@ -415,17 +419,23 @@ async function tentarProximoDaFila(barbeiro, data, hora) {
     }
 }
 
-client.on('message', async msg => {
-    if (msg.fromMe || !msg.body || msg.type === 'e2e_notification' || msg.type === 'notification_template') {
-        return; 
-    }
+// =====================================================================
+// 💬 PROCESSAMENTO DE MENSAGEM RECEBIDA (estado por número — mesma lógica de antes, só
+// trocando a leitura/resposta da mensagem pro formato do Baileys)
+// =====================================================================
+async function processarMensagem(msg, remoteJid, textoOriginal) {
+    // Ajuda a responder direto no chat de quem mandou, citando a mensagem original —
+    // equivalente ao msg.reply(...) do whatsapp-web.js.
+    const responder = (texto) => sock.sendMessage(remoteJid, { text: texto }, { quoted: msg });
 
-    const chat = await msg.getChat();
-    if (chat.isGroup) return;
-
-    const texto = msg.body.toLowerCase().trim();
-    const contato = await msg.getContact();
-    const numeroClienteWpp = contato.number || msg.from.replace('@c.us', '').replace('@lid', ''); 
+    let texto = textoOriginal.toLowerCase().trim();
+    // Prefere o número de telefone "real" quando o WhatsApp usa um JID @lid (identidade
+    // alternativa de privacidade) pro remetente — remoteJidAlt costuma trazer o @s.whatsapp.net
+    // correspondente nesses casos. Sem isso, cai pro remoteJid normal.
+    const jidPreferido = (msg.key.remoteJidAlt && msg.key.remoteJidAlt.endsWith('@s.whatsapp.net'))
+        ? msg.key.remoteJidAlt
+        : remoteJid;
+    const numeroClienteWpp = jidPreferido.split('@')[0];
 
     if (!estadosUsuarios[numeroClienteWpp]) {
         estadosUsuarios[numeroClienteWpp] = { etapa: 'verificando_identidade', clienteData: null, dadosTemporarios: null };
@@ -442,17 +452,17 @@ client.on('message', async msg => {
                 snapshotID.forEach(doc => {
                     clienteDoc = { id: doc.id, ...doc.data() };
                 });
-                
+
                 estadoAtual.clienteData = clienteDoc;
                 estadoAtual.etapa = 'menu';
             } else {
                 estadoAtual.etapa = 'perguntando_se_cliente';
-                await msg.reply(`*Olá! Bem-vindo à Barbearia Antunes!* 💈\n\nIdentificamos que este é o seu primeiro contato por este canal.\n\n*Você já possui cadastro no nosso site de agendamentos?*\n\nDigite o número da opção:\n*1️⃣* - Sim, já sou cliente\n*2️⃣* - Não, quero conhecer/agendar`);
+                await responder(`*Olá! Bem-vindo à Barbearia Antunes!* 💈\n\nIdentificamos que este é o seu primeiro contato por este canal.\n\n*Você já possui cadastro no nosso site de agendamentos?*\n\nDigite o número da opção:\n*1️⃣* - Sim, já sou cliente\n*2️⃣* - Não, quero conhecer/agendar`);
                 return;
             }
         } catch (error) {
             console.error('Erro na verificação de identidade:', error);
-            estadoAtual.etapa = 'menu'; 
+            estadoAtual.etapa = 'menu';
         }
     }
 
@@ -486,9 +496,9 @@ client.on('message', async msg => {
                 // empático quando a nota é ruim (1 ou 2), já que é quando o "porquê" mais
                 // importa pra dar um retorno de verdade ao cliente.
                 if (nota <= 2) {
-                    await msg.reply('Poxa, sentimos muito que não tenha sido uma boa experiência. 😕 Pode nos contar o que aconteceu? Isso nos ajuda a corrigir e te atender melhor da próxima vez.\n\n_(Se preferir não comentar, responda *pular*)_');
+                    await responder('Poxa, sentimos muito que não tenha sido uma boa experiência. 😕 Pode nos contar o que aconteceu? Isso nos ajuda a corrigir e te atender melhor da próxima vez.\n\n_(Se preferir não comentar, responda *pular*)_');
                 } else {
-                    await msg.reply('Muito obrigado pela nota! 🙏 Quer deixar um comentário sobre o atendimento?\n\n_(Se não quiser comentar, responda *pular*)_');
+                    await responder('Muito obrigado pela nota! 🙏 Quer deixar um comentário sobre o atendimento?\n\n_(Se não quiser comentar, responda *pular*)_');
                 }
 
                 estadoAtual.etapa = 'aguardando_comentario_nps';
@@ -497,7 +507,7 @@ client.on('message', async msg => {
                 console.error('Erro ao salvar avaliação:', error);
             }
         } else {
-            await msg.reply('⚠️ Por favor, digite apenas um número de *1 a 5* para avaliar o seu atendimento:');
+            await responder('⚠️ Por favor, digite apenas um número de *1 a 5* para avaliar o seu atendimento:');
         }
         return; // Para a execução aqui
     }
@@ -510,13 +520,13 @@ client.on('message', async msg => {
 
         try {
             if (!pulou && estadoAtual.dadosTemporarios?.avaliacaoId) {
-                // msg.body (não "texto", que está em lowercase/trim) preserva o comentário
+                // textoOriginal (não "texto", que está em lowercase/trim) preserva o comentário
                 // exatamente como o cliente escreveu — maiúsculas, acentos e pontuação.
                 await db.collection('avaliacoes').doc(estadoAtual.dadosTemporarios.avaliacaoId).update({
-                    comentario: msg.body.trim()
+                    comentario: textoOriginal.trim()
                 });
             }
-            await msg.reply(pulou
+            await responder(pulou
                 ? 'Tudo bem! Obrigado novamente pela nota. 🙏'
                 : 'Muito obrigado pelo retorno! Isso nos ajuda a manter o padrão Antunes de qualidade. 🙌');
         } catch (error) {
@@ -554,14 +564,14 @@ client.on('message', async msg => {
                     .replace(/{data}/g, dataFormatada || '')
                     .replace(/{hora}/g, dadosEspera?.horario || '')
                     .replace(/{barbeiro}/g, dadosEspera?.barbeiro || '');
-                await msg.reply(mensagem);
+                await responder(mensagem);
 
                 console.log(`✅ [Lista de Espera] ${primeiroNome} confirmou o horário.`);
                 estadoAtual.etapa = 'menu';
                 estadoAtual.dadosTemporarios = null;
             } catch (error) {
                 console.error('❌ Erro ao confirmar horário da lista de espera:', error);
-                await msg.reply('❌ Houve um erro ao confirmar seu horário. Por favor, entre em contato com a barbearia.');
+                await responder('❌ Houve um erro ao confirmar seu horário. Por favor, entre em contato com a barbearia.');
             }
             return;
         }
@@ -575,7 +585,7 @@ client.on('message', async msg => {
                     await db.collection('listaEspera').doc(dadosEspera.listaEsperaId).update({ status: 'Recusado' });
                 }
 
-                await msg.reply('Tudo bem! Você foi removido da lista de espera para esse horário. Obrigado pela paciência! 🙏');
+                await responder('Tudo bem! Você foi removido da lista de espera para esse horário. Obrigado pela paciência! 🙏');
 
                 estadoAtual.etapa = 'menu';
                 estadoAtual.dadosTemporarios = null;
@@ -589,30 +599,30 @@ client.on('message', async msg => {
             return;
         }
 
-        await msg.reply('⚠️ Por favor, responda *1* para confirmar o horário ou *2* para recusar:');
+        await responder('⚠️ Por favor, responda *1* para confirmar o horário ou *2* para recusar:');
         return;
     }
 
     if (estadoAtual.etapa === 'perguntando_se_cliente') {
         if (texto === '1' || texto === 'sim') {
             estadoAtual.etapa = 'aguardando_numero_registro';
-            await msg.reply('Perfeito! Para que eu possa localizar o seu perfil, por favor *digite o seu número de telefone com DDD* (ex: 53999999999), apenas os números:');
+            await responder('Perfeito! Para que eu possa localizar o seu perfil, por favor *digite o seu número de telefone com DDD* (ex: 53999999999), apenas os números:');
             return;
         } else if (texto === '2' || texto === 'não' || texto === 'nao') {
             estadoAtual.etapa = 'onboarding_finalizado_visitante';
-            await msg.reply('Seja muito bem-vindo! Você pode realizar o seu agendamento escolhendo os melhores profissionais e horários diretamente no nosso site: http://localhost:3000 \n\nCaso precise de suporte humano, digite *3* para falar com o barbeiro.');
+            await responder('Seja muito bem-vindo! Você pode realizar o seu agendamento escolhendo os melhores profissionais e horários diretamente no nosso site: http://localhost:3000 \n\nCaso precise de suporte humano, digite *3* para falar com o barbeiro.');
             return;
         } else {
-            await msg.reply('Por favor, responda apenas:\n*1* - Se você já possui cadastro\n*2* - Se você ainda não possui cadastro');
+            await responder('Por favor, responda apenas:\n*1* - Se você já possui cadastro\n*2* - Se você ainda não possui cadastro');
             return;
         }
     }
 
     if (estadoAtual.etapa === 'aguardando_numero_registro') {
         const numeroLimpo = limparNumeroDigitado(texto);
-        
+
         if (numeroLimpo.length < 10 || numeroLimpo.length > 11) {
-            await msg.reply('⚠️ O número digitado parece inválido. Certifique-se de incluir o DDD e o número completo (ex: 53997102442). Digite novamente:');
+            await responder('⚠️ O número digitado parece inválido. Certifique-se de incluir o DDD e o número completo (ex: 53997102442). Digite novamente:');
             return;
         }
 
@@ -621,7 +631,7 @@ client.on('message', async msg => {
             const clienteSnapshot = await db.collection('clientes').where('telefone', 'in', variacoesBusca).get();
 
             if (clienteSnapshot.empty) {
-                await msg.reply('❌ Não encontramos nenhum cadastro com esse número no nosso sistema.\n\nPor favor, confira o número e digite novamente ou digite *Menu* para reiniciar.');
+                await responder('❌ Não encontramos nenhum cadastro com esse número no nosso sistema.\n\nPor favor, confira o número e digite novamente ou digite *Menu* para reiniciar.');
                 return;
             }
 
@@ -638,21 +648,24 @@ client.on('message', async msg => {
 
             estadoAtual.clienteData = { id: docIdCliente, ...dadosCliente, whatsappId: numeroClienteWpp };
             estadoAtual.etapa = 'menu';
-            
-            msg.body = 'menu'; 
+
+            // Força a queda no bloco de menu logo abaixo nesta mesma mensagem, igual o
+            // fluxo original fazia — a condição do menu já cobre isso via estadoAtual.etapa,
+            // mas mantemos "texto" também setado por clareza.
+            texto = 'menu';
         } catch (error) {
             console.error('Erro ao vincular ID do cliente:', error);
-            await msg.reply('Ocorreu um erro interno ao salvar seus dados. Digite o número novamente para tentar o vínculo:');
+            await responder('Ocorreu um erro interno ao salvar seus dados. Digite o número novamente para tentar o vínculo:');
             return;
         }
     }
 
     if (estadoAtual.etapa === 'onboarding_finalizado_visitante') {
         if (texto === '3') {
-            await msg.reply('Um momento, por favor. O barbeiro foi notificado e irá responder assim que possível. ⏳');
+            await responder('Um momento, por favor. O barbeiro foi notificado e irá responder assim que possível. ⏳');
         } else {
             estadoAtual.etapa = 'verificando_identidade';
-            msg.body = 'menu';
+            texto = 'menu';
         }
         return;
     }
@@ -666,9 +679,9 @@ client.on('message', async msg => {
 
         try {
             const primeiroNome = clienteLogado.nome ? clienteLogado.nome.split(' ')[0] : 'Cliente';
-            
+
             const agendaSnapshot = await db.collection('agendamentos').where('clienteTelefone', 'in', telefonesBuscaAgendamento).get();
-            
+
             let resumoAgendamento = '\nVocê não possui agendamentos marcados no momento. ❌';
             if (!agendaSnapshot.empty) {
                 const proximos = [];
@@ -676,23 +689,23 @@ client.on('message', async msg => {
                 resumoAgendamento = `\n📅 *Seu próximo agendamento:* ${proximos[0].data} às ${proximos[0].horario || proximos[0].hora} (${proximos[0].servico.nome || proximos[0].servico}).`;
             }
 
-            await msg.reply(`*Olá, ${primeiroNome}!* Bem-vindo de volta à Barbearia Antunes! 💈${resumoAgendamento}\n\nComo posso ajudar hoje? Digite o número da opção:\n\n*1️⃣* - Detalhar meus agendamentos\n*2️⃣* - Cancelar um agendamento\n*3️⃣* - Falar com o barbeiro`);
-            
+            await responder(`*Olá, ${primeiroNome}!* Bem-vindo de volta à Barbearia Antunes! 💈${resumoAgendamento}\n\nComo posso ajudar hoje? Digite o número da opção:\n\n*1️⃣* - Detalhar meus agendamentos\n*2️⃣* - Cancelar um agendamento\n*3️⃣* - Falar com o barbeiro`);
+
         } catch (error) {
             console.error('Erro no menu principal:', error);
-            await msg.reply('❌ Erro ao carregar os dados da agenda. Digite "Menu" para tentar novamente.');
+            await responder('❌ Erro ao carregar os dados da agenda. Digite "Menu" para tentar novamente.');
         }
         return;
     }
 
     if (estadoAtual.etapa === 'menu') {
         if (texto === '1') {
-            await msg.reply('⏳ Buscando detalhes dos seus horários...');
+            await responder('⏳ Buscando detalhes dos seus horários...');
             try {
                 const snapshot = await db.collection('agendamentos').where('clienteTelefone', 'in', telefonesBuscaAgendamento).get();
 
                 if (snapshot.empty) {
-                    await msg.reply('Você não possui nenhum agendamento registrado.');
+                    await responder('Você não possui nenhum agendamento registrado.');
                     return;
                 }
 
@@ -704,10 +717,10 @@ client.on('message', async msg => {
                     msgAgendamentos += `💈 *Barbeiro:* ${agenda.barbeiro.nome || agenda.barbeiro}\n\n`;
                 });
 
-                await msg.reply(msgAgendamentos);
+                await responder(msgAgendamentos);
             } catch (error) {
                 console.error('Erro ao detalhar horários:', error);
-                await msg.reply('Erro ao buscar os agendamentos.');
+                await responder('Erro ao buscar os agendamentos.');
             }
             return;
         }
@@ -717,7 +730,7 @@ client.on('message', async msg => {
                 const snapshot = await db.collection('agendamentos').where('clienteTelefone', 'in', telefonesBuscaAgendamento).get();
 
                 if (snapshot.empty) {
-                    await msg.reply('Você não possui agendamentos ativos para cancelar.');
+                    await responder('Você não possui agendamentos ativos para cancelar.');
                     return;
                 }
 
@@ -737,16 +750,16 @@ client.on('message', async msg => {
                 estadoAtual.etapa = 'aguardando_selecao_cancelamento';
                 estadoAtual.dadosTemporarios = agendamentosEncontrados;
 
-                await msg.reply(listaCancelamento);
+                await responder(listaCancelamento);
             } catch (error) {
                 console.error('Erro ao listar para cancelamento:', error);
-                await msg.reply('Erro ao carregar lista de cancelamento.');
+                await responder('Erro ao carregar lista de cancelamento.');
             }
             return;
         }
 
         if (texto === '3') {
-            await msg.reply('Um momento, por favor. O barbeiro foi notificado e irá responder assim que possível. ⏳');
+            await responder('Um momento, por favor. O barbeiro foi notificado e irá responder assim que possível. ⏳');
             return;
         }
     }
@@ -755,7 +768,7 @@ client.on('message', async msg => {
         if (texto === '0') {
             estadoAtual.etapa = 'menu';
             estadoAtual.dadosTemporarios = null;
-            await msg.reply('Operação cancelada. Digite "Menu" para retornar.');
+            await responder('Operação cancelada. Digite "Menu" para retornar.');
             return;
         }
 
@@ -763,7 +776,7 @@ client.on('message', async msg => {
         const agendamentosDisponiveis = estadoAtual.dadosTemporarios;
 
         if (isNaN(escolhaIndex) || escolhaIndex < 0 || escolhaIndex >= agendamentosDisponiveis.length) {
-            await msg.reply('❌ Opção inválida. Digite o número correspondente ao agendamento ou *0* para voltar.');
+            await responder('❌ Opção inválida. Digite o número correspondente ao agendamento ou *0* para voltar.');
             return;
         }
 
@@ -771,133 +784,18 @@ client.on('message', async msg => {
 
         try {
             await db.collection('agendamentos').doc(agendamentoParaDeletar.id).delete();
-            await msg.reply(`✅ *Agendamento cancelado com sucesso!*\n\nO horário de *${agendamentoParaDeletar.data}* às *${agendamentoParaDeletar.horario || agendamentoParaDeletar.hora}* foi liberado no sistema.`);
-            
+            await responder(`✅ *Agendamento cancelado com sucesso!*\n\nO horário de *${agendamentoParaDeletar.data}* às *${agendamentoParaDeletar.horario || agendamentoParaDeletar.hora}* foi liberado no sistema.`);
+
             estadoAtual.etapa = 'menu';
             estadoAtual.dadosTemporarios = null;
         } catch (error) {
             console.error('Erro ao deletar agendamento:', error);
-            await msg.reply('❌ Houve um erro interno ao tentar processar o cancelamento. Tente novamente mais tarde.');
+            await responder('❌ Houve um erro interno ao tentar processar o cancelamento. Tente novamente mais tarde.');
         }
     }
-});
-
-// =====================================================================
-// 🔁 INICIALIZACAO COM RETRY AUTOMATICO (contorna bug conhecido do whatsapp-web.js)
-// -----------------------------------------------------------------------
-// O whatsapp-web.js tem um bug conhecido e ainda aberto na propria biblioteca (varios
-// relatos de outros usuarios, nao e coisa da nossa configuracao):
-//   https://github.com/wwebjs/whatsapp-web.js/issues/3809
-//   https://github.com/wwebjs/whatsapp-web.js/issues/127056
-//   https://github.com/wwebjs/whatsapp-web.js/issues/3792
-// A injecao do script na pagina do WhatsApp Web pode colidir com um recarregamento
-// da propria pagina bem no meio da inicializacao, gerando "Execution context was
-// destroyed, most likely because of a navigation" (ou variantes como "auth timeout"
-// / "Protocol error"). Isso fica mais frequente quanto mais lenta a maquina — o
-// Chromium demora mais pra "assentar" depois do carregamento inicial, alargando a
-// janela onde esse recarregamento pode colidir com a injecao. Nao ha flag do Chromium
-// que elimina isso (testamos varias combinacoes); e um bug ainda sem correcao
-// definitiva rio acima.
-//
-// Sem tratamento, esse erro derruba o processo Node inteiro (uncaught exception ou
-// unhandled rejection), forcando o Docker a religar o container do zero — caro nessa
-// box (Chromium sobe de novo, mais carga, mais chance de bater na mesma falha outra
-// vez). Em vez disso, capturamos especificamente esses erros JA CONHECIDOS e tentamos
-// inicializar de novo no MESMO processo (sem recriar o container). Ja vimos aqui que a
-// inicializacao as vezes funciona de primeira — o retry insiste ate isso acontecer.
-// Qualquer erro QUE NAO seja um desses conhecidos ainda derruba o processo normalmente
-// (deixamos o Docker religar), pra nao mascarar um bug real diferente.
-const ERROS_TRANSITORIOS_CONHECIDOS = [
-    'Execution context was destroyed',
-    'auth timeout',
-    'Protocol error',
-    'Target closed',
-    'Session closed'
-];
-
-function eErroTransitorioConhecido(erro) {
-    const mensagem = String((erro && erro.message) || erro || '');
-    return ERROS_TRANSITORIOS_CONHECIDOS.some(padrao => mensagem.includes(padrao));
 }
 
-let tentativasInicializacao = 0;
-const MAX_TENTATIVAS_INICIALIZACAO = 30; // teto generoso, so pra nao girar pra sempre em silencio
-let retryDeInicializacaoEmAndamento = false;
-
-async function inicializarClientComRetry() {
-    try {
-        await client.initialize();
-        tentativasInicializacao = 0;
-    } catch (erro) {
-        await tratarErroDeInicializacao(erro);
-    }
-}
-
-async function tratarErroDeInicializacao(erro) {
-    if (!eErroTransitorioConhecido(erro)) {
-        console.error('❌ Erro inesperado na inicializacao do WhatsApp (nao e um dos erros conhecidos), deixando o processo cair para o Docker religar o container:', erro);
-        throw erro;
-    }
-
-    tentativasInicializacao++;
-    console.warn(`⚠️ Erro conhecido do whatsapp-web.js na inicializacao (tentativa ${tentativasInicializacao}/${MAX_TENTATIVAS_INICIALIZACAO}): ${erro.message || erro}`);
-
-    if (tentativasInicializacao >= MAX_TENTATIVAS_INICIALIZACAO) {
-        console.error('❌ Excedeu o numero maximo de tentativas de inicializacao em processo. Deixando o processo cair para o Docker religar o container do zero.');
-        throw erro;
-    }
-
-    if (retryDeInicializacaoEmAndamento) return; // ja tem um retry em andamento, nao empilha outro
-    retryDeInicializacaoEmAndamento = true;
-
-    try {
-        try {
-            await client.destroy();
-        } catch (erroDestroy) {
-            // Se o destroy tambem falhar (comum quando o Chromium ja esta num estado ruim
-            // depois desse tipo de erro), ignora e tenta inicializar mesmo assim.
-        }
-
-        const esperaMs = Math.min(2000 * tentativasInicializacao, 15000);
-        await new Promise(resolve => setTimeout(resolve, esperaMs));
-        await inicializarClientComRetry();
-    } finally {
-        retryDeInicializacaoEmAndamento = false;
-    }
-}
-
-// Sem isso, uma promise rejeitada sem .catch() (como a que o Client.initialize() do
-// whatsapp-web.js pode gerar internamente) derruba o processo Node inteiro por padrao.
-// Com o handler, so derrubamos de proposito quando NAO for um dos erros conhecidos.
-process.on('unhandledRejection', (erro) => {
-    if (eErroTransitorioConhecido(erro)) {
-        console.warn('⚠️ Promise rejeitada com erro conhecido, tratando via retry em vez de derrubar o processo.');
-        tratarErroDeInicializacao(erro).catch(erroFinal => {
-            console.error('❌ Retry esgotado apos unhandledRejection:', erroFinal);
-            process.exit(1);
-        });
-        return;
-    }
-    console.error('❌ unhandledRejection inesperado, deixando o processo cair:', erro);
-    process.exit(1);
-});
-
-process.on('uncaughtException', (erro) => {
-    if (eErroTransitorioConhecido(erro)) {
-        console.warn('⚠️ Excecao com erro conhecido, tratando via retry em vez de derrubar o processo.');
-        tratarErroDeInicializacao(erro).catch(erroFinal => {
-            console.error('❌ Retry esgotado apos uncaughtException:', erroFinal);
-            process.exit(1);
-        });
-        return;
-    }
-    console.error('❌ uncaughtException inesperado, deixando o processo cair:', erro);
-    process.exit(1);
-});
-
-let reiniciandoBot = false;
-
-inicializarClientComRetry();
+iniciarSock().catch(erro => console.error('❌ Erro ao iniciar conexão com o WhatsApp:', erro));
 
 app.get('/api/bot/status', (req, res) => {
     res.json({
@@ -920,12 +818,9 @@ app.post('/api/notificacoes/enviar', async (req, res) => {
 
 // =====================================================================
 // 🔄 REINICIAR BOT (botão "Reiniciar" no painel admin)
-// Derruba a sessão atual do whatsapp-web.js (Puppeteer) e inicializa de
-// novo, do zero — útil quando o bot fica "travado" (ex: WhatsApp Web
-// desconectou sozinho e o client não se recuperou). Não depende de
-// Docker/Portainer: funciona igual rodando via `node index.js` direto
-// ou dentro de um container, porque reinicia o client em memória, não
-// o processo Node inteiro.
+// Encerra a conexão atual do Baileys e reconecta do zero — útil quando o bot fica
+// "travado" (ex: WhatsApp Web desconectou sozinho e não se recuperou). Não depende de
+// Docker/Portainer: reinicia a conexão em memória, não o processo Node inteiro.
 // =====================================================================
 app.post('/api/bot/reiniciar', async (req, res) => {
     if (reiniciandoBot) {
@@ -937,22 +832,21 @@ app.post('/api/bot/reiniciar', async (req, res) => {
     currentQrUrl = null;
     console.log('🔄 Reinício do bot solicitado via painel admin...');
 
-    // Responde já pro painel não ficar esperando o destroy/initialize (que
-    // envolve fechar e reabrir o Chromium do Puppeteer, pode levar alguns segundos).
+    // Responde já pro painel não ficar esperando a reconexão terminar.
     res.json({ ok: true, mensagem: 'Reinício iniciado. Acompanhe o status no painel.' });
 
     try {
-        await client.destroy();
-    } catch (erroDestroy) {
-        console.error('Aviso: erro ao destruir client (seguindo para reinicializar mesmo assim):', erroDestroy);
+        sock?.end(new Error('Reinício manual solicitado pelo painel admin'));
+    } catch (erroEnd) {
+        console.error('Aviso: erro ao encerrar conexão atual (seguindo para reconectar mesmo assim):', erroEnd);
     }
 
     botStatus = 'desconectado';
 
     try {
-        await client.initialize();
+        await iniciarSock();
     } catch (erroInit) {
-        console.error('❌ Erro ao reinicializar o client do WhatsApp:', erroInit);
+        console.error('❌ Erro ao reiniciar a conexão do WhatsApp:', erroInit);
         botStatus = 'desconectado';
     } finally {
         reiniciandoBot = false;
@@ -970,19 +864,18 @@ app.post('/api/bot/enviar-confirmacao', async (req, res) => {
     }
 
     try {
-        let numeroPuro = telefone.replace(/\D/g, ''); 
+        let numeroPuro = telefone.replace(/\D/g, '');
         if (!numeroPuro.startsWith('55')) {
             numeroPuro = '55' + numeroPuro;
         }
 
-        const contatoValido = await client.getNumberId(numeroPuro);
+        const jidValido = await obterJidValido(numeroPuro);
 
-        if (!contatoValido) {
+        if (!jidValido) {
             console.log(`❌ WhatsApp não reconheceu o número: ${numeroPuro}`);
             return res.status(404).json({ error: 'Número não registrado no WhatsApp' });
         }
 
-        const chatId = contatoValido._serialized;
         const primeiroNome = nomeCliente ? nomeCliente.split(' ')[0] : 'Cliente';
 
         let mensagem = botConfig.msgConfirmacao
@@ -992,7 +885,7 @@ app.post('/api/bot/enviar-confirmacao', async (req, res) => {
             .replace(/{hora}/g, horario)
             .replace(/{barbeiro}/g, barbeiro);
 
-        await client.sendMessage(chatId, mensagem);
+        await enviarMensagem(jidValido, mensagem);
 
         if (origemListaEspera) {
             enviarPush({
@@ -1002,10 +895,10 @@ app.post('/api/bot/enviar-confirmacao', async (req, res) => {
                 corpo: `Um horário vagou pra ${servico} dia ${data} às ${horario}, com ${barbeiro}.`
             }).catch(erro => console.error('Erro ao notificar cliente (lista de espera):', erro));
         }
-        
+
         console.log(`✅ Confirmação enviada proativamente para ${primeiroNome}`);
         res.json({ success: true, message: 'Mensagem de confirmação enviada com sucesso!' });
-        
+
     } catch (error) {
         console.error('❌ Erro ao disparar mensagem proativa:', error);
         res.status(500).json({ error: 'Erro ao enviar mensagem via WhatsApp' });
@@ -1017,7 +910,7 @@ app.post('/api/bot/enviar-confirmacao', async (req, res) => {
 // horário vaga e o primeiro da fila precisa ser avisado e perguntado se ainda quer a vaga.
 // A trava já foi transferida pro agendamento provisório (status "Aguardando Confirmação")
 // pelo frontend antes desta chamada — aqui só falta perguntar pro cliente pelo WhatsApp e
-// deixar o estado pronto pra reconhecer a resposta dele (ver client.on('message', ...) acima).
+// deixar o estado pronto pra reconhecer a resposta dele (ver processarMensagem acima).
 // =====================================================================
 app.post('/api/bot/lista-espera', async (req, res) => {
     const { telefone, nomeCliente, servico, data, horario, barbeiro, listaEsperaId, agendamentoId } = req.body;
@@ -1030,16 +923,15 @@ app.post('/api/bot/lista-espera', async (req, res) => {
         let numeroPuro = telefone.replace(/\D/g, '');
         if (!numeroPuro.startsWith('55')) numeroPuro = '55' + numeroPuro;
 
-        const contatoValido = await client.getNumberId(numeroPuro);
+        const jidValido = await obterJidValido(numeroPuro);
 
-        if (!contatoValido) {
+        if (!jidValido) {
             console.log(`❌ WhatsApp não reconheceu o número da lista de espera: ${numeroPuro}`);
             // Ninguém pra perguntar: passa a vaga direto pro próximo da fila, se houver.
             if (barbeiro && data && horario) await tentarProximoDaFila(barbeiro, data, horario);
             return res.status(404).json({ error: 'Número não registrado no WhatsApp' });
         }
 
-        const chatId = contatoValido._serialized;
         const primeiroNome = nomeCliente ? nomeCliente.split(' ')[0] : 'Cliente';
 
         // "data" chega em ISO (AAAA-MM-DD), igual bloqueioUtils.js usa pra achar o próximo da
@@ -1054,7 +946,7 @@ app.post('/api/bot/lista-espera', async (req, res) => {
             .replace(/{hora}/g, horario)
             .replace(/{barbeiro}/g, barbeiro);
 
-        await client.sendMessage(chatId, mensagem);
+        await enviarMensagem(jidValido, mensagem);
 
         enviarPush({
             destino: 'cliente',
@@ -1104,33 +996,33 @@ app.post('/api/bot/campanha', async (req, res) => {
         for (const cliente of clientes) {
             const primeiroNome = cliente.nome ? cliente.nome.split(' ')[0] : 'Cliente';
 
-            let contatoValido = null;
+            let jidValido = null;
             let numeroUsado = '';
 
             if (cliente.whatsappId) {
                 let numWpp = cliente.whatsappId.replace(/\D/g, '');
                 if (!numWpp.startsWith('55') && numWpp.length >= 10) numWpp = '55' + numWpp;
-                try { 
-                    contatoValido = await client.getNumberId(numWpp); 
-                    if (contatoValido) numeroUsado = numWpp;
+                try {
+                    jidValido = await obterJidValido(numWpp);
+                    if (jidValido) numeroUsado = numWpp;
                 } catch (e) {}
             }
 
-            if (!contatoValido && cliente.telefone) {
+            if (!jidValido && cliente.telefone) {
                 let numTel = cliente.telefone.toString().replace(/\D/g, '');
                 if (!numTel.startsWith('55') && numTel.length >= 10) numTel = '55' + numTel;
-                try { 
-                    contatoValido = await client.getNumberId(numTel); 
-                    if (contatoValido) numeroUsado = numTel;
+                try {
+                    jidValido = await obterJidValido(numTel);
+                    if (jidValido) numeroUsado = numTel;
                 } catch (e) {}
             }
 
-            if (contatoValido) {
+            if (jidValido) {
                 try {
                     const msgFormatada = mensagem.replace(/{nome}/g, primeiroNome);
-                    await client.sendMessage(contatoValido._serialized, msgFormatada);
+                    await enviarMensagem(jidValido, msgFormatada);
                     console.log(`✅ [Campanha] Mensagem enviada para ${primeiroNome} (${numeroUsado})`);
-                    
+
                     const tempoEspera = Math.floor(Math.random() * (10000 - 5000 + 1)) + 5000;
                     await delay(tempoEspera);
                 } catch (err) {
@@ -1158,10 +1050,10 @@ cron.schedule('* * * * *', async () => {
 
     if (botConfig.horarios.includes(horaAtual)) {
         console.log(`⏳ Iniciando rotina de lembretes para as ${horaAtual}...`);
-        
+
         try {
             const dataHoje = agora.toISOString().split('T')[0];
-            
+
             const snap = await db.collection('agendamentos')
                 .where('data', '==', dataHoje)
                 .where('status', '==', 'Pendente')
@@ -1170,13 +1062,13 @@ cron.schedule('* * * * *', async () => {
             snap.forEach(async (doc) => {
                 const agenda = doc.data();
                 const tel = agenda.clienteTelefone;
-                
+
                 try {
-                    let numeroPuro = tel.replace(/\D/g, ''); 
+                    let numeroPuro = tel.replace(/\D/g, '');
                     if (!numeroPuro.startsWith('55')) numeroPuro = '55' + numeroPuro;
-                    
-                    const contatoValido = await client.getNumberId(numeroPuro);
-                    if (contatoValido) {
+
+                    const jidValido = await obterJidValido(numeroPuro);
+                    if (jidValido) {
                         const primeiroNome = agenda.clienteNome ? agenda.clienteNome.split(' ')[0] : 'Cliente';
                         const horarioCorte = agenda.hora || agenda.horario;
 
@@ -1184,7 +1076,7 @@ cron.schedule('* * * * *', async () => {
                             .replace(/{nome}/g, primeiroNome)
                             .replace(/{hora}/g, horarioCorte);
 
-                        await client.sendMessage(contatoValido._serialized, msgLembrete);
+                        await enviarMensagem(jidValido, msgLembrete);
                         console.log(`✅ Lembrete enviado para ${primeiroNome}`);
                     }
 
@@ -1250,17 +1142,17 @@ cron.schedule('0 10 * * *', async () => {
                 const primeiroNome = agendaAntiga.clienteNome ? agendaAntiga.clienteNome.split(' ')[0] : 'Cliente';
 
                 try {
-                    let numeroPuro = tel.replace(/\D/g, ''); 
+                    let numeroPuro = tel.replace(/\D/g, '');
                     if (!numeroPuro.startsWith('55')) numeroPuro = '55' + numeroPuro;
-                    
-                    const contatoValido = await client.getNumberId(numeroPuro);
-                    
-                    if (contatoValido) {
+
+                    const jidValido = await obterJidValido(numeroPuro);
+
+                    if (jidValido) {
                         let msgRadar = botConfig.msgRadar.replace(/{nome}/g, primeiroNome);
-                        await client.sendMessage(contatoValido._serialized, msgRadar);
+                        await enviarMensagem(jidValido, msgRadar);
                         console.log(`✅ [Radar] Mensagem de resgate enviada para ${primeiroNome} (${numeroPuro})`);
-                        
-                        // Anti-Ban 
+
+                        // Anti-Ban
                         const tempoEspera = Math.floor(Math.random() * (10000 - 5000 + 1)) + 5000;
                         await delay(tempoEspera);
                     }
@@ -1288,24 +1180,23 @@ app.post('/api/bot/nps', async (req, res) => {
 
     res.json({ success: true, message: 'Pesquisa NPS agendada.' });
 
-    const tempoDeEspera = botConfig.npsTempoMinutos * 60 * 1000; 
-    
+    const tempoDeEspera = botConfig.npsTempoMinutos * 60 * 1000;
+
     setTimeout(async () => {
         try {
             let numeroPuro = telefone.replace(/\D/g, '');
             if (!numeroPuro.startsWith('55')) numeroPuro = '55' + numeroPuro;
 
-            const contatoValido = await client.getNumberId(numeroPuro);
+            const jidValido = await obterJidValido(numeroPuro);
 
-            if (contatoValido) {
-                const chatId = contatoValido._serialized;
+            if (jidValido) {
                 const primeiroNome = nomeCliente ? nomeCliente.split(' ')[0] : 'Cliente';
 
                 let mensagemNPS = botConfig.msgNPS
                     .replace(/{nome}/g, primeiroNome)
                     .replace(/{barbeiro}/g, barbeiro);
 
-                await client.sendMessage(chatId, mensagemNPS);
+                await enviarMensagem(jidValido, mensagemNPS);
                 console.log(`✅ Pesquisa de NPS enviada com sucesso para ${primeiroNome}`);
 
                 // 👇 A MÁGICA AQUI: Coloca o cliente no estado de avaliação
@@ -1314,12 +1205,12 @@ app.post('/api/bot/nps', async (req, res) => {
                 }
                 estadosUsuarios[numeroPuro].etapa = 'aguardando_nps';
                 // Salvamos o nome do barbeiro para saber quem ele está avaliando
-                estadosUsuarios[numeroPuro].dadosTemporarios = { barbeiro: barbeiro, nomeCliente: nomeCliente }; 
+                estadosUsuarios[numeroPuro].dadosTemporarios = { barbeiro: barbeiro, nomeCliente: nomeCliente };
             }
         } catch (error) {
             console.error('❌ Erro ao enviar NPS:', error);
         }
-    }, tempoDeEspera); 
+    }, tempoDeEspera);
 });
 
 // Lê a porta da variável de ambiente PORT (é isso que o docker-compose.yml já tenta passar),

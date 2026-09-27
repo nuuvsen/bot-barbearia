@@ -2,6 +2,7 @@ node_modules
 .git
 .wwebjs_auth
 .wwebjs_cache
+baileys_auth
 .env
 
 # Nunca copiar a chave de serviço do Firebase pra dentro da imagem — o container recebe
